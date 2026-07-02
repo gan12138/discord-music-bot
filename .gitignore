@@ -1,0 +1,10 @@
+node_modules/
+.env
+data/*.db
+data/*.sqlite
+data/musicbot.json
+*.log
+.DS_Store
+data/bot.pid
+github_example/
+www.bilibili.com_cookies.txt

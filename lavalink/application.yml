@@ -1,0 +1,41 @@
+server:
+  port: 2333
+  address: 127.0.0.1
+
+lavalink:
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false
+      soundcloud: true
+      bandcamp: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 5
+    resamplingQuality: HIGH
+    trackStuckThresholdMs: 30000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 100
+    playerUpdateInterval: 5
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - TVHTML5_SIMPLY
+      - WEB
+      - MWEB
