@@ -1,0 +1,18 @@
+[Unit]
+Description=Lavalink server for discord music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 替换为 bot 目录在你机器上的绝对路径
+WorkingDirectory=__BOT_DIR__/lavalink
+ExecStart=/usr/bin/java -jar Lavalink.jar
+Restart=always
+RestartSec=10
+# 替换为运行 lavalink 的用户和组
+User=__USER__
+Group=__GROUP__
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Discord music bot
+After=network-online.target lavalink.service
+Wants=network-online.target lavalink.service
+
+[Service]
+Type=simple
+# 替换为 bot 目录在你机器上的绝对路径
+WorkingDirectory=__BOT_DIR__
+ExecStartPre=/bin/bash -lc 'for i in {1..60}; do timeout 1 bash -c "</dev/tcp/127.0.0.1/2333" && exit 0; sleep 1; done; exit 1'
+# 用 login shell 解析 npm，兼容 nvm/pyenv/系统 npm
+ExecStart=/bin/bash -lc 'npm start'
+Restart=always
+RestartSec=10
+# 替换为运行 bot 的用户和组
+User=__USER__
+Group=__GROUP__
+
+[Install]
+WantedBy=multi-user.target
