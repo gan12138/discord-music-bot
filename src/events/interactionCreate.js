@@ -1,5 +1,6 @@
 import { Events } from 'discord.js';
 import { MusicPlayer } from '../utils/player.js';
+import { safeEditReply } from '../utils/commandSafety.js';
 
 export const name = Events.InteractionCreate;
 export const once = false;
@@ -40,11 +41,14 @@ const PRIVATE_BY_DEFAULT_COMMANDS = new Set([
   'remove',
   'resume',
   'seek',
+  'settings',
   'shuffle',
   'skip',
   'stop',
   'version',
   'volume',
+  'voice-control',
+  'voice-consent',
 ]);
 
 function shouldDefaultPrivate(interaction) {
@@ -80,7 +84,9 @@ function makeInteractionPrivateByDefault(interaction) {
 
 async function safeErrorReply(interaction, payload) {
   try {
-    if (interaction.replied || interaction.deferred) {
+    if (interaction.deferred) {
+      await safeEditReply(interaction, payload);
+    } else if (interaction.replied) {
       await interaction.followUp(payload);
     } else {
       await interaction.reply(payload);

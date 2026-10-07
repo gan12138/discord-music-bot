@@ -30,16 +30,28 @@ for (const file of commandFiles) {
 }
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
+const guildId = String(process.env.DISCORD_GUILD_ID || '').trim();
+const allowGlobalDeploy = process.env.ALLOW_GLOBAL_COMMAND_DEPLOY === 'true';
 
-try {
-  console.log(`🔄 开始刷新 ${commands.length} 个应用命令...`);
+if (guildId && !/^\d{16,22}$/.test(guildId)) {
+  console.error('❌ DISCORD_GUILD_ID must be a valid Discord snowflake.');
+  process.exitCode = 1;
+} else if (!guildId && !allowGlobalDeploy) {
+  console.error('❌ Global command deployment is disabled. Set DISCORD_GUILD_ID for a test guild or explicitly set ALLOW_GLOBAL_COMMAND_DEPLOY=true.');
+  process.exitCode = 1;
+} else {
+  const route = guildId
+    ? Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId)
+    : Routes.applicationCommands(process.env.CLIENT_ID);
 
-  const data = await rest.put(
-    Routes.applicationCommands(process.env.CLIENT_ID),
-    { body: commands }
-  );
+  try {
+    console.log(`🔄 开始刷新 ${commands.length} 个${guildId ? '服务器' : '全局'}应用命令...`);
 
-  console.log(`✅ 成功刷新 ${data.length} 个应用命令`);
-} catch (error) {
-  console.error('❌ 刷新命令失败:', error);
+    const data = await rest.put(route, { body: commands });
+
+    console.log(`✅ 成功刷新 ${data.length} 个应用命令`);
+  } catch (error) {
+    console.error('❌ 刷新命令失败:', error?.message || 'unknown error');
+    process.exitCode = 1;
+  }
 }

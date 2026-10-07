@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { MusicPlayer, musicQueue } from '../utils/player.js';
 import { durationToSeconds, formatSeekTime, parseSeekTime } from '../utils/time.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('seek')
@@ -13,6 +14,7 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { requireVoice: true, requireBotInVoice: true }))) return;
   const serverQueue = musicQueue.peek(interaction.guild.id);
   if (!serverQueue?.currentSong) {
     return interaction.reply({ content: '❌ 当前没有正在播放的歌曲。', flags: 64 });

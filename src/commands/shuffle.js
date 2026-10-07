@@ -1,12 +1,14 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('shuffle')
   .setDescription('随机打乱队列');
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { requireVoice: true, requireBotInVoice: true }))) return;
   const serverQueue = musicQueue.peek(interaction.guild.id);
 
   if (!serverQueue || serverQueue.songs.length <= 1) {

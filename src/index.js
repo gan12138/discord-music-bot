@@ -7,10 +7,12 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import 'dotenv/config';
-import ffmpegPath from 'ffmpeg-static';
+import { resolveFfmpegPath, ffmpegVersion } from './utils/ffmpeg.js';
 import { musicQueue, MusicPlayer } from './utils/player.js';
 import { createLavalinkManager, destroyLavalinkPlayer, isLavalinkEnabled, sendLavalinkRaw } from './utils/lavalink.js';
 import { flushPlaybackQueueStates } from './utils/playbackState.js';
+import { VoiceListenerManager } from './utils/voiceListenerManager.js';
+import { setVoiceControlManager } from './utils/voiceControlRuntime.js';
 import db from './models/database.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -39,13 +41,16 @@ for (const binary of ['yt-dlp']) {
   }
 }
 
-if (!isLavalinkEnabled()) {
-  const ffmpegResult = spawnSync(ffmpegPath || 'ffmpeg', ['-version'], { encoding: 'utf8' });
-  if (ffmpegResult.error || ffmpegResult.status !== 0) {
-    console.error('Missing or unusable runtime dependency: ffmpeg');
-    if (ffmpegResult.error) console.error(ffmpegResult.error.message);
+try {
+  const ffmpegPath = resolveFfmpegPath();
+  console.log(`[ffmpeg] using ${ffmpegPath} (${ffmpegVersion(ffmpegPath) || 'unknown version'})`);
+} catch (error) {
+  if (!isLavalinkEnabled()) {
+    console.error('Missing or unusable runtime dependency: ffmpeg (需 --enable-libopus)');
+    console.error(error.message);
     process.exit(1);
   }
+  console.warn(`[ffmpeg] ${error.message}; 本地播放/回落将不可用`);
 }
 
 try {
@@ -76,11 +81,14 @@ process.on('exit', () => {
 });
 
 let shuttingDown = false;
-function cleanupAllQueues() {
+async function cleanupAllQueues() {
+  const destroys = [];
   for (const [guildId, serverQueue] of musicQueue.entries()) {
     MusicPlayer.cleanupProcesses(serverQueue);
     if (isLavalinkEnabled()) {
-      destroyLavalinkPlayer(guildId, 'shutdown').catch(() => {});
+      destroys.push(destroyLavalinkPlayer(guildId, 'shutdown').catch(error => {
+        console.warn(`[Shutdown] Lavalink destroy failed guild=${guildId}:`, MusicPlayer.safeErrorMessage(error));
+      }));
     }
     try {
       serverQueue.connection?.destroy();
@@ -88,13 +96,15 @@ function cleanupAllQueues() {
       console.error('[Shutdown] failed to destroy voice connection:', error.message);
     }
   }
+  await Promise.all(destroys);
 }
 
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`Received ${signal}, shutting down...`);
-  cleanupAllQueues();
+  await voiceControlManager.stop();
+  await cleanupAllQueues();
   flushPlaybackQueueStates(musicQueue.entries());
   db.flushDB();
   client.destroy();
@@ -107,12 +117,43 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates
   ]
 });
+client.on('shardReady', shardId => {
+  console.log(`[DiscordGateway] ready shard=${shardId}`);
+});
+client.on('shardDisconnect', (event, shardId) => {
+  // Record only the close code; gateway payloads can contain session details.
+  console.warn(`[DiscordGateway] disconnected shard=${shardId} code=${event.code}`);
+});
+client.on('shardReconnecting', shardId => {
+  console.warn(`[DiscordGateway] reconnecting shard=${shardId}`);
+});
+client.on('shardResume', (shardId, replayedEvents) => {
+  console.log(`[DiscordGateway] resumed shard=${shardId} replayedEvents=${replayedEvents}`);
+});
+client.on('shardError', (error, shardId) => {
+  console.error(`[DiscordGateway] error shard=${shardId}:`, MusicPlayer.safeErrorMessage(error));
+});
+client.on('error', error => {
+  console.error('[DiscordGateway] client error:', MusicPlayer.safeErrorMessage(error));
+});
+const voiceControlManager = new VoiceListenerManager(client);
+setVoiceControlManager(voiceControlManager);
+client.once('ready', () => {
+  voiceControlManager.start().catch(error => {
+    console.error('[VoiceListener] startup failed, main bot will continue:', error.message);
+  });
+});
 
 createLavalinkManager(client, {
+  onNodeDisconnect: () => MusicPlayer.handleLavalinkNodeDisconnect(),
+  onNodeReady: (_node, payload) => MusicPlayer.handleLavalinkNodeReady({ resumed: payload?.resumed === true }),
+  onTrackStart: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackStart(guildId, player, track, payload),
+  onPlayerUpdate: (guildId, player) => MusicPlayer.handleLavalinkPlayerUpdate(guildId, player),
   onTrackEnd: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackEnd(guildId, player, track, payload),
   onQueueEnd: (guildId, player, track, payload) => MusicPlayer.handleLavalinkQueueEnd(guildId, player, track, payload),
-  onTrackError: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackError(guildId, payload),
-  onTrackStuck: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackStuck(guildId, payload),
+  onTrackError: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackError(guildId, player, track, payload),
+  onTrackStuck: (guildId, player, track, payload) => MusicPlayer.handleLavalinkTrackStuck(guildId, player, track, payload),
+  onPlayerSocketClosed: (guildId, player, payload) => MusicPlayer.handleLavalinkSocketClosed(guildId, player, payload),
 });
 
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -200,8 +241,15 @@ process.on('unhandledRejection', (error) => {
 });
 
 process.on('uncaughtException', (error) => {
+  // 语音连接快速重建时可能重复关闭已销毁的 UDP socket，属于无害的竞态错误，
+  // 不应因此让整个进程崩溃重启（会导致所有服务器播放中断）。
+  if (error?.code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') {
+    console.warn('Ignoring benign voice UDP socket race:', error.message);
+    return;
+  }
   console.error('Uncaught exception:', error);
-  cleanupAllQueues();
+  voiceControlManager.stop().catch(() => {});
+  cleanupAllQueues().catch(() => {});
   flushPlaybackQueueStates(musicQueue.entries());
   db.flushDB();
   // 未捕获异常后 Node.js 处于未定义状态，必须退出

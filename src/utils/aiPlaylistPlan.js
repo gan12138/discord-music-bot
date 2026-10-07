@@ -1,34 +1,61 @@
-import { randomUUID } from 'crypto';
+import { randomBytes } from 'crypto';
 import { Playlist } from '../models/database.js';
+import { safeText } from './commandSafety.js';
 
 const PENDING_TTL_MS = 5 * 60 * 1000;
-const pendingPlans = new Map(); // token -> { plan, userId, createdAt }
+const MAX_PENDING_PLANS = Math.max(10, Math.min(5000, Number.parseInt(process.env.AI_PLAYLIST_PENDING_MAX || '1000', 10) || 1000));
+const MAX_PENDING_PER_OWNER = Math.max(1, Math.min(50, Number.parseInt(process.env.AI_PLAYLIST_PENDING_PER_OWNER || '5', 10) || 5));
+const pendingPlans = new Map(); // token -> { plan, userId, guildId, createdAt }
 
-function purgeExpired() {
-  const now = Date.now();
+function purgeExpired(now = Date.now()) {
   for (const [token, entry] of pendingPlans) {
-    if (now - entry.createdAt > PENDING_TTL_MS) pendingPlans.delete(token);
+    if (now - entry.createdAt >= PENDING_TTL_MS) pendingPlans.delete(token);
   }
 }
 
-export function storePendingPlan(plan, userId) {
+export function storePendingPlan(plan, userId, guildId = plan?.guildId) {
   purgeExpired();
-  const token = randomUUID().slice(0, 8);
-  pendingPlans.set(token, { plan, userId, createdAt: Date.now() });
+  const ownerId = String(userId || '');
+  const ownerGuildId = String(guildId || '');
+  if (!plan || !ownerId || !ownerGuildId || String(plan.userId || '') !== ownerId || String(plan.guildId || '') !== ownerGuildId) {
+    return null;
+  }
+
+  if (pendingPlans.size >= MAX_PENDING_PLANS) return null;
+  let ownerPending = 0;
+  for (const entry of pendingPlans.values()) {
+    if (entry.userId === ownerId && entry.guildId === ownerGuildId) ownerPending += 1;
+  }
+  if (ownerPending >= MAX_PENDING_PER_OWNER) return null;
+
+  const token = randomBytes(32).toString('base64url');
+  pendingPlans.set(token, {
+    plan: structuredClone(plan),
+    userId: ownerId,
+    guildId: ownerGuildId,
+    createdAt: Date.now(),
+  });
   return token;
 }
 
-export function takePendingPlan(token, userId) {
+export function takePendingPlan(token, userId, guildId) {
   purgeExpired();
   const entry = pendingPlans.get(token);
   if (!entry) return { ok: false, reason: 'expired' };
-  if (entry.userId !== userId) return { ok: false, reason: 'wrong-user' };
+  if (entry.userId !== String(userId || '')) return { ok: false, reason: 'wrong-user' };
+  if (entry.guildId !== String(guildId || '')) return { ok: false, reason: 'wrong-guild' };
   pendingPlans.delete(token);
   return { ok: true, plan: entry.plan };
 }
 
-export function discardPendingPlan(token) {
+export function discardPendingPlan(token, userId, guildId) {
+  purgeExpired();
+  const entry = pendingPlans.get(token);
+  if (!entry) return { ok: false, reason: 'expired' };
+  if (entry.userId !== String(userId || '')) return { ok: false, reason: 'wrong-user' };
+  if (entry.guildId !== String(guildId || '')) return { ok: false, reason: 'wrong-guild' };
   pendingPlans.delete(token);
+  return { ok: true };
 }
 
 /**
@@ -58,101 +85,71 @@ export function planIsDestructive(plan) {
 export function commitPlaylistPlan(plan) {
   const summary = { created: false, renamedFrom: null, cleared: 0, removed: [], added: [], deleted: false, error: null };
 
-  // 删除整个歌单
-  if (plan.action === 'delete') {
-    const ok = Playlist.delete(plan.guildId, plan.playlistName);
-    summary.deleted = Boolean(ok);
-    if (!ok) summary.error = '播放列表不存在或已被删除。';
+  const result = Playlist.applyConditionalPlan({
+    guildId: plan.guildId,
+    userId: plan.userId,
+    playlistId: plan.playlistId,
+    playlistName: plan.playlistName,
+    expectedRevision: plan.expectedRevision,
+    requireOwner: plan.requireOwner === true,
+    action: plan.action,
+    create: plan.create,
+    renameTo: plan.renameTo,
+    clear: plan.clear,
+    removeSongIds: plan.removeSongs?.map(song => song.id).filter(Boolean),
+    addSongs: plan.addSongs,
+  });
+
+  if (!result.ok) {
+    summary.error = {
+      'stale': '播放列表在预览后已发生变化，请重新执行 /playlist ai。',
+      'wrong-guild': '播放列表不属于当前服务器。',
+      'not-owner': '只有播放列表创建者可以执行这个操作。',
+      'not-found': '播放列表不存在或已被删除。',
+      'name-conflict': '目标播放列表名称已存在。',
+      'playlist-limit': '播放列表数量已达上限（25 个）！',
+      'invalid-name': '播放列表名称无效。',
+    }[result.reason] || '播放列表操作无法执行。';
     return summary;
   }
 
-  // 新建
-  let playlist = Playlist.get(plan.guildId, plan.playlistName);
-  if (!playlist && plan.create) {
-    const playlistId = Playlist.create(plan.guildId, plan.userId, plan.playlistName);
-    if (playlistId === 'limit') {
-      summary.error = '播放列表数量已达上限（25 个）！';
-      return summary;
-    }
-    if (playlistId) {
-      summary.created = true;
-      playlist = Playlist.get(plan.guildId, plan.playlistName);
-    } else {
-      playlist = Playlist.get(plan.guildId, plan.playlistName);
-    }
-  }
-
-  if (!playlist) {
-    summary.error = `播放列表 ${plan.playlistName} 不存在。`;
-    return summary;
-  }
-
-  // 重命名
-  if (plan.renameTo && plan.renameTo !== playlist.name) {
-    const renameResult = Playlist.rename(plan.guildId, playlist.name, plan.renameTo);
-    if (renameResult === false) {
-      summary.error = `无法重命名，播放列表 ${plan.renameTo} 已存在。`;
-      return summary;
-    }
-    if (renameResult) {
-      summary.renamedFrom = playlist.name;
-      playlist = Playlist.get(plan.guildId, plan.renameTo);
-    }
-  }
-
-  // 清空
-  if (plan.clear) {
-    summary.cleared = Playlist.clearSongs(playlist.id) || 0;
-  }
-
-  // 移除（清空时跳过）
-  if (!plan.clear && plan.removeSongs?.length > 0) {
-    const ids = plan.removeSongs.map(song => song.id).filter(Boolean);
-    if (ids.length > 0) {
-      const removedCount = Playlist.removeSongs(playlist.id, ids) || 0;
-      summary.removed = plan.removeSongs.slice(0, removedCount);
-    }
-  }
-
-  // 新增
-  if (plan.addSongs?.length > 0) {
-    for (const song of plan.addSongs) {
-      const addResult = Playlist.addSong(playlist.id, song);
-      if (addResult === 'limit') break;
-      if (addResult) summary.added.push(song);
-    }
-  }
-
-  summary.finalName = playlist.name;
-  summary.finalCount = Playlist.getSongs(playlist.id).length;
+  summary.created = Boolean(result.created);
+  summary.renamedFrom = result.renamedFrom || null;
+  summary.cleared = result.cleared || 0;
+  summary.removed = result.removed || [];
+  summary.added = result.added || [];
+  summary.deleted = Boolean(result.deleted);
+  summary.finalName = result.finalName;
+  summary.finalCount = result.finalCount;
   return summary;
 }
 
 function listTitles(songs, limit = 10) {
-  return songs.slice(0, limit).map((song, index) => `${index + 1}. ${song.title}`).join('\n');
+  return songs.slice(0, limit).map((song, index) => `${index + 1}. ${safeText(song?.title || '未命名歌曲', 240)}`).join('\n');
 }
 
 function truncate(message, limit = 1900) {
-  if (message.length <= limit) return message;
-  return `${message.slice(0, limit - 20)}\n...内容过长已截断`;
+  return safeText(message, limit);
 }
 
 // 构建执行后的结果消息（命令直接执行和按钮确认共用）
 export function buildResultMessage(plan, summary) {
   if (summary.error) return `❌ ${summary.error}`;
   if (summary.deleted) {
-    return `✅ 已删除播放列表：**${plan.playlistName}**${plan.reason ? `\n\nAI 理解：${plan.reason}` : ''}`;
+    return `✅ 已删除播放列表：**${safeText(plan.playlistName, 200)}**${plan.reason ? `\n\nAI 理解：${safeText(plan.reason, 400)}` : ''}`;
   }
 
   const name = summary.finalName || plan.playlistName;
-  const title = summary.renamedFrom ? `**${summary.renamedFrom}** → **${name}**` : `**${name}**`;
+  const title = summary.renamedFrom
+    ? `**${safeText(summary.renamedFrom, 200)}** → **${safeText(name, 200)}**`
+    : `**${safeText(name, 200)}**`;
   const lines = [`✅ 已处理歌单：${title}`];
   if (summary.created) lines.push('新建：是');
   if (plan.clear) lines.push(`清空：${summary.cleared} 首`);
   if (summary.removed.length > 0) lines.push(`删除：${summary.removed.length} 首`);
   if (summary.added.length > 0) lines.push(`新增：${summary.added.length} 首`);
   lines.push(`当前共：${summary.finalCount} 首`);
-  if (plan.reason) lines.push(`\nAI 理解：${plan.reason}`);
+  if (plan.reason) lines.push(`\nAI 理解：${safeText(plan.reason, 400)}`);
   if (plan.resolution?.source === 'music-album' && summary.added.length > 0) {
     lines.push('🎯 曲目来自音乐源的官方专辑/演唱会列表。');
   }
@@ -177,13 +174,13 @@ export function buildResultMessage(plan, summary) {
 // 构建确认预览消息
 export function buildPreviewMessage(plan) {
   const lines = ['⚠️ 这个操作会改动你的歌单，请确认：', ''];
-  const name = plan.playlistName;
+  const name = safeText(plan.playlistName, 200);
 
   if (plan.action === 'delete') {
     lines.push(`🗑️ **删除整个歌单：${name}**`);
   } else {
     if (plan.create) lines.push(`➕ 新建歌单：**${name}**`);
-    if (plan.renameTo) lines.push(`✏️ 重命名：**${name}** → **${plan.renameTo}**`);
+    if (plan.renameTo) lines.push(`✏️ 重命名：**${name}** → **${safeText(plan.renameTo, 200)}**`);
     if (plan.clear) lines.push(`🧹 清空歌单全部歌曲`);
     if (plan.removeSongs?.length > 0) {
       lines.push(`➖ 移除 ${plan.removeSongs.length} 首：`);
@@ -197,7 +194,7 @@ export function buildPreviewMessage(plan) {
     }
   }
 
-  if (plan.reason) lines.push(`\nAI 理解：${plan.reason}`);
+  if (plan.reason) lines.push(`\nAI 理解：${safeText(plan.reason, 400)}`);
   lines.push('\n点击 ✅ 确认执行，或 ❌ 取消。（5 分钟内有效）');
   return truncate(lines.join('\n'));
 }

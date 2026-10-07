@@ -1,6 +1,13 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { BILIBILI_USER_AGENT, cookieArgs, formatDuration, ytdlpSemaphore } from './shared.js';
+import {
+  isAllowedResolvedAudioUrl,
+  isBilibiliInput,
+  normalizeBilibiliInput,
+  parseBilibiliInput,
+  redactExternalError,
+} from './urlAllowlist.js';
 
 const execFileAsync = promisify(execFile);
 const EXEC_OPTIONS = { timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
@@ -28,7 +35,7 @@ function describeBilibiliError(message = '') {
 
 function bilibiliUrl(data = {}) {
   const value = String(data.webpage_url || data.original_url || data.url || '');
-  const normalized = Bilibili.normalizeInput(value);
+  const normalized = normalizeBilibiliInput(value);
   return normalized || value || null;
 }
 
@@ -37,13 +44,13 @@ function audioUrl(data = {}) {
     ...(Array.isArray(data.requested_downloads) ? data.requested_downloads : []),
     ...(Array.isArray(data.requested_formats) ? data.requested_formats : []),
   ].find(format => format?.url && format.vcodec === 'none');
-  if (requested?.url) return requested.url;
+  if (isAllowedResolvedAudioUrl(requested?.url, 'bilibili')) return requested.url;
 
   const audioFormats = Array.isArray(data.formats)
     ? data.formats.filter(format => format?.url && format.vcodec === 'none')
     : [];
   audioFormats.sort((a, b) => (Number(b.abr || b.tbr) || 0) - (Number(a.abr || a.tbr) || 0));
-  return audioFormats[0]?.url || null;
+  return isAllowedResolvedAudioUrl(audioFormats[0]?.url, 'bilibili') ? audioFormats[0].url : null;
 }
 
 function audioUrlExpiresAt(url) {
@@ -61,50 +68,31 @@ function audioUrlExpiresAt(url) {
 
 export class Bilibili {
   static isBilibiliInput(input) {
-    const text = String(input || '').trim();
-    return Boolean(
-      /^BV[a-zA-Z0-9]+$/.test(text) ||
-      /^av\d+$/i.test(text) ||
-      /^(https?:\/\/)?(?:www\.|m\.)?bilibili\.com\/video\/(?:BV[a-zA-Z0-9]+|av\d+)/i.test(text) ||
-      /^(https?:\/\/)?b23\.tv\/[a-zA-Z0-9]+/i.test(text)
-    );
+    return isBilibiliInput(input);
   }
 
   static normalizeInput(input) {
-    const text = String(input || '').trim();
-    const bvMatch = text.match(/^BV[a-zA-Z0-9]+$/);
-    if (bvMatch) return `https://www.bilibili.com/video/${bvMatch[0]}`;
-
-    const avMatch = text.match(/^av\d+$/i);
-    if (avMatch) return `https://www.bilibili.com/video/${avMatch[0].toLowerCase()}`;
-
-    if (/^(?:www\.|m\.)?bilibili\.com\/video\//i.test(text)) {
-      return `https://${text}`;
-    }
-
-    if (/^b23\.tv\//i.test(text)) {
-      return `https://${text}`;
-    }
-
-    return text;
+    return normalizeBilibiliInput(input);
   }
 
-  static async getVideoInfo(input) {
+  static async getVideoInfo(input, { signal } = {}) {
     try {
-      const normalizedUrl = this.normalizeInput(input);
-      await ytdlpSemaphore.acquire();
+      const parsed = parseBilibiliInput(input);
+      if (!parsed) return null;
+      const normalizedUrl = parsed.canonicalUrl;
+      await ytdlpSemaphore.acquire(signal);
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          ...cookieArgs(),
+          ...cookieArgs('bilibili'),
           '--referer', BILIBILI_REFERER,
           '--user-agent', BILIBILI_USER_AGENT,
           normalizedUrl,
           '--dump-json',
           '--no-download',
           '--no-playlist',
-        ], EXEC_OPTIONS));
+        ], { ...EXEC_OPTIONS, signal, killSignal: 'SIGKILL' }));
       } finally {
         ytdlpSemaphore.release();
       }
@@ -124,7 +112,8 @@ export class Bilibili {
         views: data.view_count || 0,
       };
     } catch (error) {
-      console.error('Bilibili video info error:', error.message);
+      if (signal?.aborted) throw signal.reason || error;
+      console.error('Bilibili video info error:', redactExternalError(error));
       throw new Error(describeBilibiliError(error.message));
     }
   }

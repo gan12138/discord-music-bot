@@ -1,12 +1,13 @@
 import { SlashCommandBuilder } from 'discord.js';
-import { musicQueue } from '../utils/player.js';
+import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { isLavalinkEnabled, destroyLavalinkPlayer } from '../utils/lavalink.js';
 import { findAIMusic } from '../utils/aiMusic.js';
 import { addSongsToPlayback } from '../utils/playback.js';
 import { getAIConfigStatus } from '../utils/aiClient.js';
 import { versionPreferenceLabel } from '../utils/versionPreference.js';
-import { describeStyle } from '../utils/radio.js';
+import { describeStyle, invalidateRadioGeneration } from '../utils/radio.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('ai-music')
@@ -27,6 +28,7 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { requireVoice: true }))) return;
   const prompt = interaction.options.getString('prompt');
   const count = interaction.options.getInteger('count') || 3;
   const serverQueue = musicQueue.peek(interaction.guild.id);
@@ -35,7 +37,7 @@ export async function execute(interaction) {
   await interaction.deferReply({ flags: 64 });
 
   let queuedSongs = [];
-  let queueStartLength = null;
+  let queuedItemIds = [];
 
   const aiConfig = getAIConfigStatus();
   if (!aiConfig.ok) {
@@ -57,10 +59,13 @@ export async function execute(interaction) {
     }
 
     const activeQueue = musicQueue.get(interaction.guild.id);
-    queueStartLength = activeQueue.songs.length;
     queuedSongs = result.songs;
+    queuedItemIds = queuedSongs
+      .map(song => MusicPlayer.ensureQueueItemId(song)?.queueItemId)
+      .filter(Boolean);
     let radioNote = '';
     if (result.radioStyle) {
+      invalidateRadioGeneration(activeQueue, 'ai-radio-style');
       activeQueue.radio.enabled = true;
       activeQueue.radio.currentStyle = result.radioStyle;
       activeQueue.radio.pendingStyle = null;
@@ -78,8 +83,9 @@ export async function execute(interaction) {
   } catch (error) {
     console.error('[ai-music] command failed:', error);
     const activeQueue = musicQueue.peek(interaction.guild.id);
-    if (activeQueue && typeof queueStartLength === 'number') {
-      activeQueue.songs.splice(queueStartLength, queuedSongs.length);
+    if (activeQueue && queuedItemIds.length) {
+      MusicPlayer.removeQueueItemsById(activeQueue, queuedItemIds);
+      savePlaybackState(interaction.guild.id, activeQueue, { immediate: true });
     }
     if (activeQueue && !activeQueue.playing && activeQueue.songs.length === 0) {
       if (activeQueue.is247) {

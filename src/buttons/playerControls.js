@@ -1,7 +1,10 @@
 import { musicQueue, MusicPlayer } from '../utils/player.js';
-import { describeStyle, ensureRadioQueue, refreshRadioSeed } from '../utils/radio.js';
+import { describeStyle, ensureRadioQueue, invalidateRadioGeneration, refreshRadioSeed } from '../utils/radio.js';
 import { buildNowPlayingPayload, isPanelCurrent, refreshNowPlayingPanel } from '../utils/playerPanel.js';
+import { GuildSettings } from '../models/database.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { getVoiceControlManager } from '../utils/voiceControlRuntime.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const customId = 'player';
 
@@ -29,11 +32,13 @@ function radioGeneratedMessage(generatedCount, serverQueue) {
 }
 
 async function waitForSongChange(guildId, timeoutMs = 3000) {
-  await MusicPlayer.waitForAdvance(guildId, timeoutMs);
+  const queue = musicQueue.peek(guildId);
+  await MusicPlayer.waitForAdvance(guildId, timeoutMs, queue?.advanceSignal || 0);
 }
 
 export async function execute(interaction) {
   await interaction.deferReply({ flags: 64 });
+  if (!interaction.guildId) return interaction.editReply('❌ 这个面板只能在服务器中使用。');
   const [, action, panelId] = interaction.customId.split(':');
   const serverQueue = musicQueue.peek(interaction.guild.id);
 
@@ -41,21 +46,64 @@ export async function execute(interaction) {
     return interaction.editReply('📭 队列为空。');
   }
 
-  if (!serverQueue.currentSong && action !== 'queue') {
+  if (!serverQueue.currentSong && !['queue', 'voice'].includes(action)) {
     return interaction.editReply('❌ 当前没有正在播放的歌曲。');
   }
 
+  if (action === 'voice') {
+    if (!(await requireMusicAccess(interaction, {
+      manageGuildOnly: true,
+    }))) return;
+  } else if (action !== 'queue' && !(await requireMusicAccess(interaction, {
+    requireVoice: true,
+    requireBotInVoice: true,
+  }))) return;
+
   const voiceChannel = interaction.member.voice.channel;
-  if (action !== 'queue' && (!voiceChannel || voiceChannel.id !== interaction.guild.members.me.voice.channel?.id)) {
-    return interaction.editReply('❌ 你需要和我在同一个语音频道！');
+  if (panelId && !isPanelCurrent(serverQueue, panelId)) {
+    return interaction.editReply('⚠️ 此按钮来自旧播放面板，已失效。请使用最新的播放面板。');
   }
 
-  const stalePanelNote = panelId && !isPanelCurrent(serverQueue, panelId) && action !== 'queue'
-    ? '\n⚠️ 你使用的是旧面板，操作已对当前播放生效。'
-    : '';
+  if (action === 'voice') {
+    const voiceSettings = GuildSettings.get(interaction.guild.id).voiceControl;
+    if (!voiceSettings.enabled) {
+      return interaction.editReply('❌ 语音控制当前未开启，请管理员先执行 `/voice-control enable`。');
+    }
+    const manager = getVoiceControlManager();
+    if (!manager?.diagnostics(interaction.guild.id)?.listenerReady) {
+      return interaction.editReply('❌ 语音监听 Bot 当前未在线或未完成配置。');
+    }
+
+    const diagnostics = manager.diagnostics(interaction.guild.id);
+    const shouldJoin = diagnostics.guildConnected !== true;
+    GuildSettings.update(interaction.guild.id, {
+      voiceControl: {
+        listenerAutoJoin: shouldJoin,
+      },
+    });
+
+    await manager.syncGuild(interaction.guild.id).catch(error => {
+      console.warn('[VoiceControl] panel listener sync failed:', error.message);
+    });
+    const after = manager.diagnostics(interaction.guild.id);
+    await refreshNowPlayingPanel(interaction.guild.id, interaction.channel, serverQueue);
+
+    if (shouldJoin) {
+      const content = after.guildConnected
+        ? '✅ 语音子 Bot 已加入当前语音频道，并会跟随主音乐 Bot。云 STT 和个人授权设置保持不变。'
+        : '⚠️ 已开启语音子 Bot 自动加入，但它暂时还没有连接成功，请稍后再试或检查权限。';
+      return serverQueue.notificationMode === 'private'
+        ? interaction.editReply({ content, ...buildNowPlayingPayload(serverQueue, serverQueue.currentSong) })
+        : interaction.editReply(content);
+    }
+    const content = '✅ 语音子 Bot 已离开语音频道。云 STT 和个人授权设置保持不变。';
+    return serverQueue.notificationMode === 'private'
+      ? interaction.editReply({ content, ...buildNowPlayingPayload(serverQueue, serverQueue.currentSong) })
+      : interaction.editReply(content);
+  }
 
   const respondWithPanel = async (content, { includeStaleNote = true } = {}) => {
-    const note = includeStaleNote && serverQueue.notificationMode !== 'private' ? stalePanelNote : '';
+    const note = includeStaleNote ? '' : '';
     if (serverQueue.notificationMode === 'panel') {
       await refreshNowPlayingPanel(interaction.guild.id, interaction.channel, serverQueue);
     }
@@ -70,12 +118,12 @@ export async function execute(interaction) {
 
   if (action === 'pause') {
     if (serverQueue.pausedAt) {
-      if (!MusicPlayer.resume(interaction.guild.id)) {
+      if (!await MusicPlayer.resume(interaction.guild.id)) {
         return interaction.editReply('❌ 继续播放失败，当前播放器状态不同步。');
       }
       return respondWithPanel('▶️ 已继续播放。');
     }
-    if (!MusicPlayer.pause(interaction.guild.id)) {
+    if (!await MusicPlayer.pause(interaction.guild.id)) {
       return interaction.editReply('❌ 暂停失败，当前播放器状态不同步。');
     }
     return respondWithPanel('⏸️ 已暂停播放。');
@@ -90,9 +138,10 @@ export async function execute(interaction) {
   }
 
   if (action === 'next' || action === 'skip') {
+    const advanceSignal = serverQueue.advanceSignal || 0;
     const result = await MusicPlayer.skip(interaction.guild.id);
     if (result.ok) {
-      await waitForSongChange(interaction.guild.id);
+      await MusicPlayer.waitForAdvance(interaction.guild.id, 3000, advanceSignal);
       return respondWithPanel(`⏭️ 已切换到下一首：${result.song.title}`);
     }
     if (result.reason === 'no-radio-recommendation') {
@@ -108,9 +157,10 @@ export async function execute(interaction) {
   }
 
   if (action === 'stop') {
-    MusicPlayer.stop(interaction.guild.id);
+    const stopped = await MusicPlayer.stop(interaction.guild.id);
+    if (!stopped) return interaction.editReply('❌ 停止失败，当前播放器状态不同步。');
     await refreshNowPlayingPanel(interaction.guild.id, interaction.channel, serverQueue);
-    return interaction.editReply(`⏹️ 已停止播放并清空队列。${stalePanelNote}`);
+    return interaction.editReply('⏹️ 已停止播放并清空队列。');
   }
 
   if (action === 'loop') {
@@ -121,7 +171,9 @@ export async function execute(interaction) {
   }
 
   if (action === 'radio') {
+    invalidateRadioGeneration(serverQueue, 'panel-radio-toggle');
     serverQueue.radio.enabled = !serverQueue.radio.enabled;
+    serverQueue.radioQueue = [];
     if (serverQueue.radio.enabled) {
       MusicPlayer.clearIdleLeaveTimer(serverQueue);
       serverQueue.queueEnded = false;

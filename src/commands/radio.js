@@ -1,9 +1,10 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { refreshNowPlayingPanel } from '../utils/playerPanel.js';
-import { describeStyle, ensureRadioQueue, refreshRadioSeed } from '../utils/radio.js';
+import { describeStyle, ensureRadioQueue, invalidateRadioGeneration, refreshRadioSeed } from '../utils/radio.js';
 import { savePlaybackState } from '../utils/playbackState.js';
 import { versionPreferenceLabel } from '../utils/versionPreference.js';
+import { requireGuild, requireMusicAccess } from '../utils/commandSafety.js';
 
 const GENRES = [
   ['mandopop', '华语流行'],
@@ -128,6 +129,11 @@ export const data = buildRadioCommandData();
 
 export async function execute(interaction) {
   const subcommand = interaction.options.getSubcommand();
+  if (subcommand === 'status') {
+    if (!(await requireGuild(interaction))) return;
+  } else if (!(await requireMusicAccess(interaction, {
+    requireVoice: subcommand === 'start' || subcommand === 'reset',
+  }))) return;
   const serverQueue = subcommand === 'start'
     ? musicQueue.get(interaction.guild.id)
     : musicQueue.peek(interaction.guild.id);
@@ -147,7 +153,10 @@ export async function execute(interaction) {
     return interaction.reply({ content: '❌ 当前没有活跃的播放队列，请先使用 /play 播放音乐。', flags: 64 });
   }
 
-  serverQueue.textChannel = interaction.channel;
+  if (subcommand !== 'status') {
+    serverQueue.textChannel = interaction.channel;
+    serverQueue.textChannelId = interaction.channel.id;
+  }
 
   if (subcommand === 'start') {
     await interaction.deferReply();
@@ -199,6 +208,7 @@ export async function execute(interaction) {
   }
 
   if (subcommand === 'stop') {
+    invalidateRadioGeneration(serverQueue, 'radio-stop');
     serverQueue.radio.enabled = false;
     serverQueue.radioQueue = [];
     serverQueue.radio.pendingStyle = null;
@@ -231,6 +241,7 @@ export async function execute(interaction) {
     }
 
     if (serverQueue.playing) {
+      invalidateRadioGeneration(serverQueue, 'radio-style');
       serverQueue.radio.currentStyle = nextStyle;
       serverQueue.radio.pendingStyle = null;
       serverQueue.radioQueue = [];
@@ -244,6 +255,7 @@ export async function execute(interaction) {
       return interaction.reply(`✅ 已设置新风格，下一首自动续播生效：${describeStyle(nextStyle)}`);
     }
 
+    invalidateRadioGeneration(serverQueue, 'radio-style');
     serverQueue.radio.currentStyle = nextStyle;
     serverQueue.radioQueue = [];
     if (hasExplicitStyle(nextStyle)) serverQueue.radio.seedSong = null;
@@ -270,6 +282,7 @@ export async function execute(interaction) {
     try {
       MusicPlayer.clearIdleLeaveTimer(serverQueue);
       serverQueue.queueEnded = false;
+      invalidateRadioGeneration(serverQueue, 'radio-reset');
       serverQueue.radioQueue = [];
       serverQueue.radio.enabled = true;
       serverQueue.radioFailureCount = 0;

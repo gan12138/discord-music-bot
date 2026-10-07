@@ -1,6 +1,8 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { musicQueue } from '../utils/player.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { GuildSettings } from '../models/database.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 const LABELS = {
   private: '私人面板模式（推荐）',
@@ -26,10 +28,13 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { manageGuildOnly: true }))) return;
+  await interaction.deferReply({ flags: 64 });
   const mode = interaction.options.getString('mode');
+  GuildSettings.update(interaction.guild.id, { notificationMode: mode });
   const serverQueue = musicQueue.peek(interaction.guild.id);
   if (!serverQueue) {
-    return interaction.reply({ content: `✅ 正在播放提示已设置为：${LABELS[mode]}。下次播放时生效。`, flags: 64 });
+    return interaction.editReply({ content: `✅ 正在播放提示已设置为：${LABELS[mode]}。下次播放时生效。` });
   }
   serverQueue.notificationMode = mode;
   if (mode !== 'panel') {
@@ -37,5 +42,5 @@ export async function execute(interaction) {
     serverQueue.nowPlayingChannelId = null;
   }
   savePlaybackState(interaction.guild.id, serverQueue, { immediate: true });
-  return interaction.reply(`✅ 正在播放提示已设置为：${LABELS[mode]}。`);
+  return interaction.editReply(`✅ 正在播放提示已设置为：${LABELS[mode]}。`);
 }

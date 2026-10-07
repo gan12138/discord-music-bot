@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { MusicPlayer, musicQueue } from '../utils/player.js';
 import { AUDIO_FILTERS, filterLabel } from '../utils/filters.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('filter')
@@ -18,6 +19,7 @@ export const data = new SlashCommandBuilder()
   });
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { requireVoice: true, requireBotInVoice: true }))) return;
   const mode = interaction.options.getString('mode');
   const serverQueue = musicQueue.peek(interaction.guild.id);
   if (!serverQueue?.currentSong) {

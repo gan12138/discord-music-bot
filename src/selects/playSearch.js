@@ -1,4 +1,5 @@
 import { addSongsToPlayback } from '../utils/playback.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 const SESSION_TTL_MS = 3 * 60 * 1000;
 
@@ -31,11 +32,17 @@ export async function execute(interaction) {
     return interaction.reply({ content: '❌ 只有发起这次搜索的人可以选择歌曲。', flags: 64 });
   }
 
+  if (interaction.guildId !== session.guildId) {
+    return interaction.reply({ content: '❌ 这个搜索结果不属于当前服务器。', flags: 64 });
+  }
+
   const selectedIndex = Number(interaction.values[0]);
   const song = session.results[selectedIndex];
   if (!song) {
     return interaction.reply({ content: '❌ 选择的歌曲不存在，请重新搜索。', flags: 64 });
   }
+
+  if (!(await requireMusicAccess(interaction, { requireVoice: true }))) return;
 
   const voiceChannel = interaction.member.voice.channel;
   if (!voiceChannel || voiceChannel.id !== session.voiceChannelId) {

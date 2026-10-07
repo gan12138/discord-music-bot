@@ -2,6 +2,7 @@ import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { refreshNowPlayingPanel } from '../utils/playerPanel.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { requireGuild, requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('247')
@@ -24,16 +25,27 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(interaction) {
   const subcommand = interaction.options.getSubcommand();
+  if (subcommand === 'status') {
+    if (!(await requireGuild(interaction))) return;
+  } else if (!(await requireMusicAccess(interaction, {
+    manageGuildOnly: true,
+    requireVoice: subcommand === 'on',
+  }))) return;
   const serverQueue = subcommand === 'status'
     ? musicQueue.peek(interaction.guild.id)
-    : musicQueue.get(interaction.guild.id);
+    : subcommand === 'on'
+      ? musicQueue.get(interaction.guild.id)
+      : musicQueue.peek(interaction.guild.id);
 
   if (!serverQueue) {
     return interaction.reply('ℹ️ 24/7 模式未开启。');
   }
 
-  serverQueue.textChannel = interaction.channel;
-  serverQueue.textChannelId = interaction.channel.id;
+  const updateTextChannel = subcommand !== 'status';
+  if (updateTextChannel) {
+    serverQueue.textChannel = interaction.channel;
+    serverQueue.textChannelId = interaction.channel.id;
+  }
 
   if (subcommand === 'on') {
     serverQueue.is247 = true;

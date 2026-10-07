@@ -212,7 +212,7 @@ export async function parseAIPlaylistIntent(prompt, { count = 20, playlists = []
         },
       }),
     },
-  ], { temperature: 0.2 });
+  ], { temperature: 0.2, feature: 'playlist' });
 
   return normalizeIntent(raw, { selectedName, addLimit });
 }
@@ -257,7 +257,7 @@ async function aiTracklistFallback(content, limit) {
       role: 'user',
       content: `请列出最多 ${limit} 首符合「${desc}」的真实、知名歌曲。返回格式示例：{"songs":["陈奕迅 - 十年","张学友 - 吻别"]}`,
     },
-  ], { temperature: 0.3 });
+  ], { temperature: 0.3, feature: 'playlist' });
   return normalizeStringList(extractSongList(raw), limit, 160);
 }
 

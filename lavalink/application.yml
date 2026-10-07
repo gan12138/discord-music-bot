@@ -3,8 +3,13 @@ server:
   address: 127.0.0.1
 
 lavalink:
+  plugins:
+    # 快照版含 1.18.2 之后的 TV 客户端修复（#233 PlayStation 4 UA、#231 客户端版本），
+    # 修复 TV 报 "The page needs to be reloaded" 导致 OAuth 无法生效的问题。
+    - dependency: "dev.lavalink.youtube:youtube-plugin:f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3"
+      snapshot: true
   server:
-    password: "youshallnotpass"
+    password: "${LAVALINK_PASSWORD}"
     sources:
       youtube: false
       soundcloud: true
@@ -21,11 +26,19 @@ lavalink:
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 100
     playerUpdateInterval: 5
+    timeouts:
+      connectTimeoutMs: 5000
+      connectionRequestTimeoutMs: 3000
+      socketTimeoutMs: 8000
 
 logging:
   level:
-    root: INFO
+    root: WARN
     lavalink: INFO
+    "lavalink.server.io.RequestLoggingFilter": OFF
+    # OAuth 设备码配对提示与 token 刷新结果只在 INFO 级输出，
+    # root=WARN 会吞掉它们，导致首次授权拿不到配对码。
+    "dev.lavalink.youtube.http.YoutubeOauth2Handler": INFO
 
 plugins:
   youtube:
@@ -33,9 +46,31 @@ plugins:
     allowSearch: true
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
+    # poToken/visitorData 由 lavalink-pot-refresh.timer 通过 POST /youtube
+    # 热更新，不把短效 token 写入版本控制配置。
+    # 远程签名解密：本机 yt-cipher (127.0.0.1:8001)，解决内置 cipher 提取失败
+    remoteCipher:
+      url: "http://127.0.0.1:8001"
+      userAgent: "discord-music-bot"
+    # OAuth：TV 客户端是插件中唯一支持 OAuth 的客户端，用 burner 账号登录后
+    # 绕过 poToken/SABR 限制。refreshToken 存放于 lavalink.env（权限 600、已 gitignore）。
+    # 重新授权：清空 YOUTUBE_OAUTH_REFRESH_TOKEN 后重启，按日志中的配对码重新授权。
+    oauth:
+      enabled: true
+      refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
+    # 客户端说明（2026-08 实测）：
+    # TV 必须排在播放链最前，它是唯一支持 OAuth 的客户端，靠 burner 账号登录
+    # 绕过 YouTube 的 poToken/SABR 限制；其余客户端仅作兜底，实际都已失效：
+    # WEB/WEBEMBEDDED 因 YouTube 把 GVS poToken 绑定到具体 video ID 而只拿到
+    # SABR-only 响应（有 itag 但无 url），ANDROID_VR/TVHTML5_SIMPLY/MWEB 分别被
+    # requires-login / not-a-bot / 403 拦截。ANDROID 被上游标记 broken，不要加入。
+    # 注意 TV 不支持元数据，无法用 /youtube/stream 路由验证；要验证整体可用性，
+    # 直接 GET /youtube/stream/{videoId}（不带 withClient）或实际播放。
     clients:
       - MUSIC
+      - TV
       - ANDROID_VR
       - TVHTML5_SIMPLY
+      - WEBEMBEDDED
       - WEB
       - MWEB

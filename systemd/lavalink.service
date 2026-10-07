@@ -5,14 +5,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 替换为 bot 目录在你机器上的绝对路径
-WorkingDirectory=__BOT_DIR__/lavalink
-ExecStart=/usr/bin/java -jar Lavalink.jar
-Restart=always
+WorkingDirectory=/opt/discord-music-bot/lavalink
+EnvironmentFile=/etc/discord-music-bot/lavalink.env
+Environment="LAVALINK_ENV_FILE=/etc/discord-music-bot/lavalink.env"
+ExecStart=/usr/bin/java -jar /opt/discord-music-bot/lavalink/Lavalink.jar
+# Ignore refresh failures so a temporary YouTube/provider outage does not restart Lavalink.
+ExecStartPost=-/usr/bin/env bash /opt/discord-music-bot/lavalink/refresh-youtube-pot.sh
+Restart=on-failure
 RestartSec=10
-# 替换为运行 lavalink 的用户和组
-User=__USER__
-Group=__GROUP__
+User=lavalink
+Group=lavalink
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/discord-music-bot/lavalink
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target

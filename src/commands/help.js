@@ -28,6 +28,9 @@ export async function execute(interaction) {
     { name: '/panel', desc: '显示播放控制面板' },
     { name: '/notify', desc: '设置正在播放提示方式' },
     { name: '/version', desc: '设置AI/Radio版本偏好' },
+    { name: '/settings dj-role', desc: '设置音乐控制 DJ 角色' },
+    { name: '/voice-control stt-policy', desc: '设置关闭或全员 STT' },
+    { name: '/voice-consent', desc: '管理云 STT 授权、退出或重新加入' },
   ];
 
   const helpText = commands.map(cmd => `**${cmd.name}** - ${cmd.desc}`).join('\n');

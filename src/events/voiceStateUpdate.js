@@ -1,9 +1,11 @@
 import { Events } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
-import { savePlaybackState } from '../utils/playbackState.js';
+import { freezePlaybackProgress, savePlaybackState } from '../utils/playbackState.js';
+import { refreshNowPlayingPanel } from '../utils/playerPanel.js';
 
 export const name = Events.VoiceStateUpdate;
 export const once = false;
+const BOT_DISCONNECT_RECOVERY_DELAY_MS = 3_000;
 
 export function execute(oldState, newState) {
   const guildId = newState.guild.id;
@@ -18,17 +20,37 @@ export function execute(oldState, newState) {
 
   // Bot 被踢出语音频道
   if (isBotVoiceUpdate && oldState.channelId && !newState.channelId) {
+    if (serverQueue.backendTransitioning || Date.now() < (serverQueue.suppressVoiceRecoveryUntil || 0)) return;
     if (serverQueue.is247) {
+      const backend = MusicPlayer.activeBackend(serverQueue);
+      if (serverQueue.currentSong) freezePlaybackProgress(serverQueue);
       serverQueue.connection = null;
       serverQueue.player = null;
       serverQueue.playing = false;
       serverQueue.advancing = false;
       serverQueue.audioResource = null;
-      serverQueue.seekOffsetSeconds = 0;
-      serverQueue.startedAt = null;
-      serverQueue.pausedAt = null;
-      serverQueue.suppressVoiceRecoveryUntil = Date.now() + 15_000;
+      serverQueue.activeBackend = backend;
+      if (backend === 'lavalink') {
+        serverQueue.backendUnavailable = true;
+        serverQueue.playbackBlocked = true;
+        serverQueue.lavalinkInterrupted = true;
+      }
+      serverQueue.pendingRecovery = {
+        guildId,
+        playbackId: serverQueue.playbackId,
+        songId: serverQueue.currentSong?.queueItemId || null,
+        reason: 'Bot 离开语音频道',
+        at: Date.now(),
+      };
+      serverQueue.suppressVoiceRecoveryUntil = Date.now() + BOT_DISCONNECT_RECOVERY_DELAY_MS;
       savePlaybackState(guildId, serverQueue, { immediate: true });
+      setTimeout(() => {
+        const queue = musicQueue.peek(guildId);
+        if (queue !== serverQueue || !queue.is247 || queue.connection) return;
+        MusicPlayer.recoverVoiceConnection(guildId, 'bot-disconnected').catch(error => {
+          console.error('[VoiceState] 24/7 reconnect failed:', MusicPlayer.safeErrorMessage(error));
+        });
+      }, BOT_DISCONNECT_RECOVERY_DELAY_MS).unref?.();
       return;
     }
 
@@ -48,6 +70,10 @@ export function execute(oldState, newState) {
     return;
   }
 
+  // Backend switches suppress only the Bot's own synthetic voice events. Human
+  // joins/leaves must still update idle/24/7 state during a backend switch.
+  if (isBotVoiceUpdate) return;
+
   if (!serverQueue.connection) return;
 
   const botChannel = botMember.voice.channel;
@@ -55,7 +81,7 @@ export function execute(oldState, newState) {
 
   const humanCount = botChannel.members.filter(m => !m.user.bot).size;
 
-  // 语音频道空人时：非 24/7 模式安排空闲离开；24/7 模式标记暂停 radio
+  // 24/7 空频道让当前歌曲播完，但阻止后续队列和 Radio 推进。
   if (humanCount === 0) {
     if (serverQueue.is247) {
       if (!serverQueue.pausedByEmptyChannel) {
@@ -75,26 +101,26 @@ export function execute(oldState, newState) {
     serverQueue.pausedByEmptyChannel = false;
     savePlaybackState(guildId, serverQueue);
 
-    // 当前没在播放时，优先恢复待播队列，再回退到历史最后一首歌
-    if (!serverQueue.playing && !serverQueue.currentSong && serverQueue.connection) {
-      if (serverQueue.songs.length > 0 || serverQueue.radioQueue.length > 0 || serverQueue.radio?.enabled) {
+    if (!MusicPlayer.isPlaybackActuallyActive(serverQueue) && serverQueue.connection) {
+      if (serverQueue.currentSong) {
+        MusicPlayer.ensurePlaybackOutput(guildId, 'human-returned', { force: true })
+          .then(() => refreshNowPlayingPanel(guildId, serverQueue.textChannel, serverQueue))
+          .catch(error => {
+            console.error('[VoiceState] current song recovery failed:', error.message);
+          });
+      } else if (serverQueue.songs.length > 0 || serverQueue.radioQueue.length > 0 || serverQueue.radio?.enabled) {
         MusicPlayer.playSong(guildId, serverQueue.textChannel).catch(error => {
           console.error('[VoiceState] auto-resume from queue failed:', error.message);
         });
-      } else {
-        const lastSong = serverQueue.history?.at(-1);
-        if (lastSong) {
-          MusicPlayer.playSong(guildId, serverQueue.textChannel, lastSong, lastSong.source || 'manual').catch(error => {
-            console.error('[VoiceState] auto-resume from history failed:', error.message);
-          });
-        }
       }
     }
   }
 
   if (serverQueue.currentSong && serverQueue.playing) {
-    MusicPlayer.ensurePlaybackOutput(guildId, 'human-returned').catch(error => {
-      console.error('[VoiceState] playback output recovery failed:', error.message);
-    });
+    MusicPlayer.ensurePlaybackOutput(guildId, 'human-returned')
+      .then(() => refreshNowPlayingPanel(guildId, serverQueue.textChannel, serverQueue))
+      .catch(error => {
+        console.error('[VoiceState] playback output recovery failed:', error.message);
+      });
   }
 }

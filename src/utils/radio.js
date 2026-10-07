@@ -1,5 +1,6 @@
 import { YouTube } from './youtube.js';
 import { requestAIJson } from './aiClient.js';
+import { playbackAvailability, playbackSourceKey } from './playbackAvailability.js';
 import {
   applyVersionPreferenceToQuery,
   sortByVersionPreference,
@@ -105,6 +106,25 @@ const DEFAULT_NEGATIVE_KEYWORDS = [
   '有冇諗過',
   '确认',
   '確認',
+  '大收集',
+  '合集',
+  '歌回',
+  '精華',
+  '精华',
+  '串燒',
+  '串烧',
+  '盤點',
+  '盘点',
+  '聽錯',
+  '听错',
+  '搶麥',
+  '抢麦',
+  '被抄',
+  '這才是',
+  '这才是',
+  '重出江湖',
+  'medley',
+  'compilation',
 ];
 
 const VERSION_TITLE_KEYWORDS = [
@@ -305,12 +325,18 @@ function cjkCoreTokens(value) {
 function looksLikeNonMusicVideo(song) {
   const title = normalizeText(song.title);
   const author = normalizeText(song.author || '');
-  const hasMusicSignal = MUSIC_SIGNAL_KEYWORDS.some(keyword => title.includes(normalizeText(keyword)) || author.includes(normalizeText(keyword)));
+  const hasTitleMusicSignal = MUSIC_SIGNAL_KEYWORDS.some(keyword => title.includes(normalizeText(keyword)));
+  const hasMusicSignal = hasTitleMusicSignal || MUSIC_SIGNAL_KEYWORDS.some(keyword => author.includes(normalizeText(keyword)));
   const hasNonMusicAuthor = NON_MUSIC_AUTHOR_KEYWORDS.some(keyword => author.includes(normalizeText(keyword)));
   const hasNewsLikeTitle = /[?？]/.test(song.title || '') || title.length > 80;
+  const hasStrongOfficialSignal = /official|官方|mv/.test(title);
+  const hasHashtag = /[#＃]/.test(song.title || '');
 
   if (hasNonMusicAuthor && !hasMusicSignal) return true;
-  if (hasNewsLikeTitle && !hasMusicSignal) return true;
+  // 疑问式/新闻式标题必须标题本身带音乐信号，作者名带"音乐"不再豁免
+  if (hasNewsLikeTitle && !hasTitleMusicSignal) return true;
+  // 带 hashtag 的基本是剪辑/短视频，除非有官方 MV 强信号
+  if (hasHashtag && !hasStrongOfficialSignal) return true;
   return false;
 }
 
@@ -558,7 +584,7 @@ async function searchRadioCandidates(queries, count, versionPreference) {
   for (const query of queries.slice(0, 10)) {
     const results = await YouTube.search(applyVersionPreferenceToQuery(query, versionPreference), 10);
     candidates.push(...results);
-    if (candidates.length >= count * 8) break;
+    if (candidates.length >= count * 12) break;
   }
   return candidates;
 }
@@ -588,7 +614,7 @@ async function aiInferStyle(history, currentStyle) {
         ],
       }),
     },
-  ], { temperature: 0.2 });
+  ], { temperature: 0.2, feature: 'radio' });
 
   if (!result?.style || typeof result.confidence !== 'number') return null;
   return result;
@@ -630,7 +656,7 @@ async function aiQueries(style, seedSong, history, versionPreference = 'any') {
         },
       }),
     },
-  ]);
+  ], { temperature: 0.7, feature: 'radio' });
 
   if (!Array.isArray(result?.queries) || result.queries.length === 0) return null;
   return {
@@ -648,8 +674,8 @@ function filterCandidates(candidates, excludedSongs, negativeKeywords = DEFAULT_
   } = options;
   const seen = new Set(excludedSongs.map(songKey));
   const seenVideoIds = new Set(excludedSongs.map(song => videoIdFromUrl(song.url)).filter(Boolean));
-  const seenTitleCores = new Set(relaxed ? [] : excludedSongs.map(song => titleCore(song.title)).filter(Boolean));
-  const seenFingerprints = new Set(relaxed ? [] : excludedSongs.map(songFingerprint).filter(Boolean));
+  const seenTitleCores = new Set(excludedSongs.map(song => titleCore(song.title)).filter(Boolean));
+  const seenFingerprints = new Set(excludedSongs.map(songFingerprint).filter(Boolean));
   const authorCounts = new Map();
   const filtered = [];
   const blockedVersionKeywords = enforceVersionBlocks ? versionNegativeKeywords(versionPreference).map(normalizeText) : [];
@@ -663,14 +689,14 @@ function filterCandidates(candidates, excludedSongs, negativeKeywords = DEFAULT_
     const author = normalizeText(song.author || 'unknown');
     const durationSeconds = parseDurationSeconds(song.duration);
 
-    if (!song?.url || !song?.title || seen.has(key)) continue;
+    if (!song?.url || !song?.title || seen.has(key) || playbackAvailability.isCoolingDown(song)) continue;
     if (!videoId) continue;
     if (videoId && seenVideoIds.has(videoId)) continue;
-    if (!relaxed && core && seenTitleCores.has(core)) continue;
-    if (!relaxed && fingerprint && seenFingerprints.has(fingerprint)) continue;
-    if (!relaxed && [...seenTitleCores].some(existing => existing && core && (existing.includes(core) || core.includes(existing)))) continue;
+    if (core && seenTitleCores.has(core)) continue;
+    if (fingerprint && seenFingerprints.has(fingerprint)) continue;
+    if ([...seenTitleCores].some(existing => existing && core && (existing.includes(core) || core.includes(existing)))) continue;
     if (hardExcludedSongs.some(existing => sameSongByTitle(existing, song))) continue;
-    if (!relaxed && excludedSongs.some(existing => sameSongByTitle(existing, song))) continue;
+    if (excludedSongs.some(existing => sameSongByTitle(existing, song))) continue;
     if (filtered.some(existing => sameSongByTitle(existing, song))) continue;
     if (filtered.some(existing => songKey(existing) === key)) continue;
     if (!durationSeconds || durationSeconds < MIN_DURATION_SECONDS || durationSeconds > MAX_DURATION_SECONDS) continue;
@@ -692,7 +718,7 @@ function filterCandidates(candidates, excludedSongs, negativeKeywords = DEFAULT_
 
 function fallbackPlayableCandidates(candidates, serverQueue, count, versionPreference = 'any') {
   const hardExcludedSongs = buildHardExcludedSongs(serverQueue, serverQueue.radio?.seedSong || null);
-  const recentHistory = (serverQueue.history || []).slice(-10);
+  const recentHistory = serverQueue.history || [];
   const currentVideoId = videoIdFromUrl(serverQueue.currentSong?.url);
   const queuedVideoIds = new Set([
     ...(serverQueue.songs || []),
@@ -708,7 +734,7 @@ function fallbackPlayableCandidates(candidates, serverQueue, count, versionPrefe
     const key = songKey(song);
     const title = normalizeText(song?.title);
 
-    if (!song?.title || !song?.url || !videoId) continue;
+    if (!song?.title || !song?.url || !videoId || playbackAvailability.isCoolingDown(song)) continue;
     if (videoId === currentVideoId || queuedVideoIds.has(videoId)) continue;
     if (recentVideoIds.has(videoId)) continue;
     if (seen.has(videoId) || seen.has(key)) continue;
@@ -728,6 +754,48 @@ function fallbackPlayableCandidates(candidates, serverQueue, count, versionPrefe
   return sortByVersionPreference(playable, versionPreference);
 }
 
+function recycleOldHistorySongs(serverQueue, count, versionPreference = 'any') {
+  const history = serverQueue.history || [];
+  if (history.length === 0) return [];
+  const currentVideoId = videoIdFromUrl(serverQueue.currentSong?.url);
+  const seedVideoId = videoIdFromUrl(serverQueue.radio?.seedSong?.url);
+  const queuedVideoIds = new Set([
+    ...(serverQueue.songs || []),
+    ...(serverQueue.radioQueue || []),
+  ].map(song => videoIdFromUrl(song.url)).filter(Boolean));
+
+  const isEligible = song => {
+    const vid = videoIdFromUrl(song?.url);
+    if (!song?.title || !song?.url || !vid || playbackAvailability.isCoolingDown(song)) return false;
+    if (vid === currentVideoId || vid === seedVideoId) return false;
+    if (queuedVideoIds.has(vid)) return false;
+    return true;
+  };
+
+  // history[0] is oldest; skip the most recent chunk so we recycle genuinely
+  // old songs instead of what just played.
+  const recentSkip = Math.min(history.length, 30);
+  let pool = history.slice(0, history.length - recentSkip).filter(isEligible);
+  if (pool.length < count) {
+    pool = history.filter(isEligible);
+  }
+  if (pool.length === 0) return [];
+
+  const shuffled = pool.slice().sort(() => Math.random() - 0.5);
+  const seen = new Set();
+  const picked = [];
+  for (const song of shuffled) {
+    const vid = videoIdFromUrl(song.url);
+    const key = songKey(song);
+    if (seen.has(vid) || seen.has(key)) continue;
+    seen.add(vid);
+    seen.add(key);
+    picked.push({ ...song, requestedBy: '自动续播', source: 'radio', recycled: true });
+    if (picked.length >= count) break;
+  }
+  return sortByVersionPreference(picked, versionPreference);
+}
+
 export function describeStyle(style = {}) {
   const parts = [
     GENRE_LABELS[style.genre] || style.genre,
@@ -736,6 +804,37 @@ export function describeStyle(style = {}) {
     MOOD_LABELS[style.mood] || style.mood,
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(' / ') : '根据当前歌曲自动推荐';
+}
+
+// Conservative replacement matching. A one-word title needs an independently
+// known artist (e.g. a Topic channel); uploader names are not assumed to be singers.
+export function isRadioAlternative(original, candidate, versionPreference = 'any') {
+  if (!playbackSourceKey(candidate) || playbackSourceKey(candidate) === playbackSourceKey(original)) return false;
+  if (playbackAvailability.isCoolingDown(candidate)) return false;
+  const normalize = value => normalizeText(value).normalize('NFKC')
+    .replace(/劉/g, '刘').replace(/陳/g, '陈').replace(/單/g, '单').replace(/車/g, '车').replace(/輩/g, '辈');
+  const title = normalize(candidate.title);
+  if (/\b(cover|karaoke|remix|sped up|slowed|instrumental)\b|翻唱|伴奏|混音/.test(title)) return false;
+  const live = value => /\blive\b|\bconcert\b|现场|現場|演唱会|演唱會/.test(normalize(value));
+  if (live(original.title) !== live(candidate.title)) return false;
+  if (versionPreference === 'normal' && live(candidate.title)) return false;
+  const aDuration = parseDurationSeconds(original.duration);
+  const bDuration = parseDurationSeconds(candidate.duration);
+  if (!aDuration || !bDuration || Math.abs(aDuration - bDuration) > Math.max(15, aDuration * 0.12)) return false;
+  const originalTitle = normalize(stripVersionText(original.title));
+  const tokens = originalTitle.split(/\s+/).filter(token => token.length >= 2);
+  if (!tokens.length || !tokens.every(token => title.includes(token))) return false;
+  const artist = original.artist || (/-\s*topic$/i.test(original.author || '')
+    ? original.author.replace(/-\s*topic$/i, '').trim() : null);
+  if (artist) return normalize(`${candidate.title} ${candidate.author || ''}`).includes(normalize(artist));
+  return tokens.length >= 2;
+}
+
+export async function findRadioAlternatives(song, versionPreference, { signal, excludedUrls = [] } = {}) {
+  signal?.throwIfAborted();
+  const results = await YouTube.search(applyVersionPreferenceToQuery(song.title, versionPreference), 8, { signal });
+  return results.filter(candidate => !excludedUrls.includes(candidate.url)
+    && isRadioAlternative(song, candidate, versionPreference)).slice(0, 2);
 }
 
 const AUTODETECT_COOLDOWN_MS = 3 * 60 * 1000;
@@ -765,12 +864,22 @@ export async function maybeApplyAutodetect(serverQueue) {
   }
 
   if (!shouldSwitch || !nextStyle) return false;
+  invalidateRadioGeneration(serverQueue, 'radio-autodetect');
   serverQueue.radio.currentStyle = { ...serverQueue.radio.currentStyle, ...nextStyle };
   serverQueue.radioQueue = [];
   return true;
 }
 
 const AI_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+
+export function invalidateRadioGeneration(serverQueue, reason = 'changed') {
+  if (!serverQueue) return 0;
+  serverQueue.radioGeneration = (Number(serverQueue.radioGeneration) || 0) + 1;
+  serverQueue.radio.lastInvalidationReason = reason;
+  serverQueue.radio.isGenerating = false;
+  serverQueue.radio._generatingPromise = null;
+  return serverQueue.radioGeneration;
+}
 
 export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATCH_SIZE) {
   if (!serverQueue.radio?.enabled) return [];
@@ -793,6 +902,7 @@ export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATC
     return generatedByExistingTask;
   }
   serverQueue.radio.isGenerating = true;
+  const generation = Number(serverQueue.radioGeneration) || 0;
   let resolveGenerating;
   serverQueue.radio._generatingPromise = new Promise(resolve => { resolveGenerating = resolve; });
 
@@ -802,16 +912,19 @@ export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATC
     const seedSong = pickRadioSeed(serverQueue);
     const history = serverQueue.history || [];
 
-    // AI 失败后 5 分钟内直接走 fallback，不浪费请求
+    // AI 连续失败 2 次才进入 5 分钟冷却，容忍冷启动等单次抖动
     const radioAIEnabled = isRadioAIEnabled();
     const aiCoolingDown = serverQueue.radio._lastAIFailureAt &&
       Date.now() - serverQueue.radio._lastAIFailureAt < AI_RETRY_COOLDOWN_MS;
     const aiPlan = radioAIEnabled && !aiCoolingDown ? await aiQueries(style, seedSong, history, versionPreference) : null;
-    if (radioAIEnabled && !aiPlan && !aiCoolingDown) {
-      serverQueue.radio._lastAIFailureAt = Date.now();
-    }
     if (aiPlan) {
       serverQueue.radio._lastAIFailureAt = null;
+      serverQueue.radio._consecutiveAIFailures = 0;
+    } else if (radioAIEnabled && !aiCoolingDown) {
+      serverQueue.radio._consecutiveAIFailures = (serverQueue.radio._consecutiveAIFailures || 0) + 1;
+      if (serverQueue.radio._consecutiveAIFailures >= 2) {
+        serverQueue.radio._lastAIFailureAt = Date.now();
+      }
     }
 
     const queries = expandRadioQueries(aiPlan?.queries?.length ? aiPlan.queries : fallbackQueries(style, seedSong, history), style);
@@ -838,6 +951,7 @@ export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATC
       fallbackSongs: 0,
       relaxedSongs: 0,
       playableFallbackSongs: 0,
+      recycledSongs: 0,
       generatedSongs: 0,
     };
 
@@ -891,12 +1005,21 @@ export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATC
       if (RADIO_DEBUG) console.log('[Radio] playable fallback songs:', songs.length);
     }
 
+    if (songs.length === 0) {
+      songs = recycleOldHistorySongs(serverQueue, count, versionPreference);
+      diagnostics.recycledSongs = songs.length;
+      if (RADIO_DEBUG) console.log('[Radio] recycled songs:', songs.length);
+    }
+
     if (RADIO_DEBUG) console.log('[Radio] generated songs:', songs.length);
+    if (!serverQueue.radio.enabled || (Number(serverQueue.radioGeneration) || 0) !== generation) {
+      return [];
+    }
     serverQueue.radio.lastGeneratedAt = Date.now();
     diagnostics.status = songs.length > 0 ? 'generated' : 'empty';
     diagnostics.generatedSongs = songs.length;
     serverQueue.radio.lastGeneration = diagnostics;
-    console.log(`[Radio] status=${diagnostics.status} generated=${songs.length} candidates=${diagnostics.candidates} strict=${diagnostics.strictSongs} fallback=${diagnostics.fallbackSongs} relaxed=${diagnostics.relaxedSongs} playable=${diagnostics.playableFallbackSongs} style="${diagnostics.style}" version=${versionPreference} seed="${diagnostics.seedTitle || ''}"`);
+    console.log(`[Radio] status=${diagnostics.status} generated=${songs.length} candidates=${diagnostics.candidates} strict=${diagnostics.strictSongs} fallback=${diagnostics.fallbackSongs} relaxed=${diagnostics.relaxedSongs} playable=${diagnostics.playableFallbackSongs} recycled=${diagnostics.recycledSongs} style="${diagnostics.style}" version=${versionPreference} seed="${diagnostics.seedTitle || ''}"`);
     // 动态轮转 seedSong，让下一次生成使用不同的种子歌搜索
     if (songs.length > 0) {
       serverQueue.radio.seedSong = serverQueue.currentSong || serverQueue.history?.at(-1) || songs[0];
@@ -904,8 +1027,10 @@ export async function generateRadioSongs(serverQueue, count = DEFAULT_RADIO_BATC
     serverQueue.radioQueue.push(...songs);
     return songs;
   } finally {
-    serverQueue.radio.isGenerating = false;
-    serverQueue.radio._generatingPromise = null;
+    if ((Number(serverQueue.radioGeneration) || 0) === generation) {
+      serverQueue.radio.isGenerating = false;
+      serverQueue.radio._generatingPromise = null;
+    }
     resolveGenerating();
   }
 }

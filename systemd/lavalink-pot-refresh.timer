@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Lavalink YouTube poToken every four hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=4h
+Persistent=true
+Unit=lavalink-pot-refresh.service
+
+[Install]
+WantedBy=timers.target

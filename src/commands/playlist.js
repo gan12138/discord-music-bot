@@ -15,6 +15,15 @@ import {
   buildResultMessage,
   buildPreviewMessage,
 } from '../utils/aiPlaylistPlan.js';
+import {
+  protectInteraction,
+  requireGuild,
+  requireMusicAccess,
+  safeEditReply,
+  safeReply,
+  safeText,
+} from '../utils/commandSafety.js';
+import { looksLikeUrl, parseBilibiliInput, parseYouTubeUrl } from '../utils/urlAllowlist.js';
 
 function hasOwnerPermission(playlist, userId) {
   return playlist?.userId === userId;
@@ -34,7 +43,7 @@ function playlistChoices(guildId, focused) {
   return Playlist.getAll(guildId)
     .filter(playlist => !query || playlist.name.toLowerCase().includes(query))
     .slice(0, 25)
-    .map(playlist => ({ name: playlist.name, value: playlist.name }));
+    .map(playlist => ({ name: safeText(playlist.name, 100), value: playlist.name.slice(0, 100) }));
 }
 
 export const data = new SlashCommandBuilder()
@@ -140,11 +149,14 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function autocomplete(interaction) {
+  if (!interaction.guildId) return interaction.respond([]);
   const focused = interaction.options.getFocused();
   await interaction.respond(playlistChoices(interaction.guild.id, focused));
 }
 
 export async function execute(interaction) {
+  protectInteraction(interaction);
+  if (!(await requireGuild(interaction))) return;
   const subcommand = interaction.options.getSubcommand();
   const guildId = interaction.guild.id;
   const userId = interaction.user.id;
@@ -156,8 +168,10 @@ export async function execute(interaction) {
       
       if (playlistId === 'limit') {
         await interaction.reply('❌ 播放列表数量已达上限（25 个）！');
+      } else if (playlistId === 'invalid') {
+        await interaction.reply('❌ 播放列表名称无效（长度 1-100，不能包含控制字符）。');
       } else if (playlistId) {
-        await interaction.reply(`✅ 已创建播放列表: **${name}**`);
+        await interaction.reply(`✅ 已创建播放列表: **${safeText(name, 100)}**`);
       } else {
         await interaction.reply('❌ 播放列表已存在！');
       }
@@ -176,7 +190,7 @@ export async function execute(interaction) {
         break;
       }
       Playlist.delete(guildId, name);
-      await interaction.reply(`✅ 已删除播放列表: **${name}**`);
+      await interaction.reply(`✅ 已删除播放列表: **${safeText(name, 100)}**`);
       break;
     }
 
@@ -213,9 +227,16 @@ export async function execute(interaction) {
 
         const { Bilibili } = await import('../utils/bilibili.js');
         const { YouTube } = await import('../utils/youtube.js');
-        const video = Bilibili.isBilibiliInput(url)
-          ? await Bilibili.getVideoInfo(url)
-          : await YouTube.getVideoInfo(url);
+        const bilibili = parseBilibiliInput(url);
+        const youtube = parseYouTubeUrl(url, { allowPlaylist: false });
+        if (!bilibili && !youtube) {
+          return interaction.editReply(looksLikeUrl(url)
+            ? '❌ 已拒绝该外部地址，只支持严格的 YouTube 单视频或 Bilibili 视频链接。'
+            : '❌ 只支持严格的 YouTube 单视频或 Bilibili 视频链接。');
+        }
+        const video = bilibili
+          ? await Bilibili.getVideoInfo(bilibili.canonicalUrl)
+          : await YouTube.getVideoInfo(youtube.canonicalUrl);
         
         if (!video) {
           return interaction.editReply('❌ 无法获取视频信息！');
@@ -225,7 +246,7 @@ export async function execute(interaction) {
         if (addResult === 'limit') {
           return interaction.editReply('❌ 播放列表歌曲数量已达上限（200 首）！');
         }
-        await interaction.editReply(`✅ 已添加 **${video.title}** 到播放列表 **${name}**`);
+        await interaction.editReply(`✅ 已添加 **${safeText(video.title, 500)}** 到播放列表 **${safeText(name, 100)}**`);
       } catch (error) {
         console.error('[Playlist] add error:', error.message);
         await interaction.editReply('❌ 添加歌曲失败，请稍后再试。');
@@ -273,6 +294,7 @@ export async function execute(interaction) {
     }
 
     case 'play': {
+      if (!(await requireMusicAccess(interaction, { requireVoice: true }))) return;
       await interaction.deferReply({ flags: 64 });
       try {
         const name = interaction.options.getString('name');
@@ -287,11 +309,6 @@ export async function execute(interaction) {
         
         if (songs.length === 0) {
           return interaction.editReply('📭 播放列表为空！');
-        }
-
-        const voiceChannel = interaction.member.voice.channel;
-        if (!voiceChannel) {
-          return interaction.editReply('❌ 你需要先加入语音频道！');
         }
 
         await addSongsToPlayback(interaction, songs, {
@@ -348,6 +365,7 @@ export async function execute(interaction) {
 
         const targetPlaylist = existing;
         const effectiveName = existing ? existing.name : targetName;
+        const targetSnapshot = existing ? Playlist.getSnapshot(guildId, existing.name) : null;
 
         // 破坏性操作权限校验（仅对已存在歌单有意义；新建的归当前用户）
         const destructiveIntent = intent.action === 'delete'
@@ -372,9 +390,16 @@ export async function execute(interaction) {
         // 预先解析待加歌曲
         let resolution = { songs: [], missing: [], source: 'search', estimated: false };
         if (wantsSongs && intent.action !== 'delete') {
-          await interaction.editReply(`🔍 已理解歌单 **${effectiveName}**，正在从音乐源获取最多 ${count} 首歌...`);
+          await interaction.editReply(`🔍 已理解歌单 **${safeText(effectiveName, 100)}**，正在从音乐源获取最多 ${count} 首歌...`);
           const existingSongs = targetPlaylist ? Playlist.getSongs(targetPlaylist.id) : [];
           resolution = await resolveContent(intent.content, existingSongs, count);
+        }
+
+        if (targetSnapshot) {
+          const latestSnapshot = Playlist.getSnapshot(guildId, targetSnapshot.name);
+          if (!latestSnapshot || latestSnapshot.id !== targetSnapshot.id || latestSnapshot.revision !== targetSnapshot.revision) {
+            return interaction.editReply('❌ 播放列表在处理期间已发生变化，请重新执行 /playlist ai。');
+          }
         }
 
         const plan = {
@@ -382,6 +407,9 @@ export async function execute(interaction) {
           userId,
           action: intent.action,
           playlistName: effectiveName,
+          playlistId: targetSnapshot?.id || null,
+          expectedRevision: targetSnapshot?.revision ?? null,
+          requireOwner: destructiveIntent,
           create: shouldCreate,
           renameTo: intent.action === 'rename' ? intent.renameTo : null,
           clear: intent.action === 'clear',
@@ -394,7 +422,8 @@ export async function execute(interaction) {
 
         // 破坏性操作 → 预览 + 确认按钮；否则直接执行
         if (planIsDestructive(plan)) {
-          const token = storePendingPlan(plan, userId);
+          const token = storePendingPlan(plan, userId, guildId);
+          if (!token) return interaction.editReply('❌ 当前确认操作过多，请稍后再试。');
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`aiplaylist:confirm:${token}`).setLabel('确认').setStyle(ButtonStyle.Danger).setEmoji('✅'),
             new ButtonBuilder().setCustomId(`aiplaylist:cancel:${token}`).setLabel('取消').setStyle(ButtonStyle.Secondary).setEmoji('❌'),

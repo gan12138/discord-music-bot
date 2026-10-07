@@ -1,6 +1,14 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { cookieArgs, formatDuration, ytdlpSemaphore } from './shared.js';
+import { classifyPlaybackError } from './playbackErrors.js';
+import {
+  isAllowedResolvedAudioUrl,
+  looksLikeUrl,
+  normalizeYouTubeUrl,
+  parseYouTubeUrl,
+  redactExternalError,
+} from './urlAllowlist.js';
 
 const execFileAsync = promisify(execFile);
 const EXEC_OPTIONS = { timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
@@ -11,14 +19,14 @@ const DEFAULT_AUDIO_URL_TTL_MS = 10 * 60 * 1000;
 const AUDIO_URL_EXPIRY_BUFFER_MS = 60 * 1000;
 
 function videoUrl(data = {}) {
-  const id = videoId(data.webpage_url) || videoId(data.url) || videoId(data.id);
+  const id = videoId(data.id) || videoId(data.webpage_url) || videoId(data.original_url) || videoId(data.url);
   return id ? `https://www.youtube.com/watch?v=${id}` : null;
 }
 
 function videoId(value) {
   const text = String(value || '');
-  const match = text.match(/(?:v=|youtu\.be\/)?([a-zA-Z0-9_-]{11})(?:\b|$)/);
-  return match?.[1] || null;
+  if (/^[a-zA-Z0-9_-]{11}$/.test(text)) return text;
+  return parseYouTubeUrl(text, { allowPlaylist: false })?.videoId || null;
 }
 
 function isPlayableVideo(data = {}) {
@@ -58,7 +66,8 @@ function filterAlbumTracks(tracks, limit = 50) {
 }
 
 function audioUrl(data = {}) {
-  return data.requested_downloads?.[0]?.url || data.url || null;
+  const candidate = data.requested_downloads?.[0]?.url || data.url || null;
+  return isAllowedResolvedAudioUrl(candidate, 'youtube') ? candidate : null;
 }
 
 function audioUrlExpiresAt(url) {
@@ -75,19 +84,28 @@ function audioUrlExpiresAt(url) {
 }
 
 export class YouTube {
-  static async search(query, limit = 10) {
+  static async search(query, limit = 10, { signal } = {}) {
+    const searchQuery = String(query || '').trim();
+    const resultLimit = Math.max(1, Math.min(10, Math.trunc(Number(limit) || 10)));
+    if (
+      !searchQuery
+      || searchQuery.length > 2000
+      || /[\u0000-\u001f\u007f-\u009f]/.test(searchQuery)
+      || looksLikeUrl(searchQuery)
+    ) return [];
+
     try {
-      await ytdlpSemaphore.acquire();
+      await ytdlpSemaphore.acquire(signal);
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          ...cookieArgs(),
-          `ytsearch${limit}:${query}`,
+          ...cookieArgs('youtube'),
+          `ytsearch${resultLimit}:${searchQuery}`,
           '--dump-json',
           '--no-download',
           '--flat-playlist',
-        ], EXEC_OPTIONS));
+        ], { ...EXEC_OPTIONS, signal, killSignal: 'SIGKILL' }));
       } finally {
         ytdlpSemaphore.release();
       }
@@ -110,35 +128,37 @@ export class YouTube {
 
       return results;
     } catch (error) {
-      console.error('YouTube search error:', error.message);
+      if (signal?.aborted) throw signal.reason || error;
+      console.error('YouTube search error:', redactExternalError(error));
       return [];
     }
   }
 
   static normalizeUrl(url) {
-    const shortUrlMatch = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-    if (shortUrlMatch) {
-      return `https://www.youtube.com/watch?v=${shortUrlMatch[1]}`;
-    }
-    return url;
+    return normalizeYouTubeUrl(url);
   }
 
-  static async getVideoInfo(url) {
+  static async getVideoInfo(url, { signal, timeoutMs = EXEC_OPTIONS.timeout, throwOnError = false } = {}) {
+    const callerSignal = signal;
+    const deadlineSignal = AbortSignal.timeout(Math.max(1, Math.min(EXEC_OPTIONS.timeout, timeoutMs)));
+    signal = signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
     try {
-      const normalizedUrl = this.normalizeUrl(url);
+      const parsed = parseYouTubeUrl(url, { allowPlaylist: false });
+      if (!parsed || parsed.kind !== 'video') return null;
+      const normalizedUrl = parsed.canonicalUrl;
 
-      await ytdlpSemaphore.acquire();
+      await ytdlpSemaphore.acquire(signal);
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          ...cookieArgs(),
+          ...cookieArgs('youtube'),
           normalizedUrl,
           '-f', YTDLP_AUDIO_FORMAT,
           '--dump-json',
           '--no-download',
           '--no-playlist',
-        ], EXEC_OPTIONS));
+        ], { ...EXEC_OPTIONS, signal, killSignal: 'SIGKILL' }));
       } finally {
         ytdlpSemaphore.release();
       }
@@ -158,24 +178,33 @@ export class YouTube {
         views: data.view_count || 0
       };
     } catch (error) {
-      console.error('YouTube video info error:', error.message);
+      if (callerSignal?.aborted) throw callerSignal.reason || error;
+      if (throwOnError) {
+        const failure = new Error(redactExternalError(error));
+        failure.category = classifyPlaybackError(error.stderr || error.message, 'yt-dlp').category;
+        throw failure;
+      }
+      console.error('YouTube video info error:', redactExternalError(error));
       return null;
     }
   }
 
   static async getPlaylist(url) {
     try {
-      const normalizedUrl = this.normalizeUrl(url);
+      const parsed = parseYouTubeUrl(url, { allowPlaylist: true });
+      if (!parsed || parsed.kind !== 'playlist') return null;
+      const normalizedUrl = parsed.canonicalUrl;
       await ytdlpSemaphore.acquire();
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          ...cookieArgs(),
+          ...cookieArgs('youtube'),
           normalizedUrl,
           '--dump-json',
           '--no-download',
           '--flat-playlist',
+          '--playlist-end', String(MAX_PLAYLIST_ITEMS),
         ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }));
       } finally {
         ytdlpSemaphore.release();
@@ -197,7 +226,7 @@ export class YouTube {
         })
         .filter(Boolean);
     } catch (error) {
-      console.error('YouTube playlist error:', error.message);
+      console.error('YouTube playlist error:', redactExternalError(error));
       return null;
     }
   }
@@ -214,7 +243,7 @@ export class YouTube {
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          ...cookieArgs(),
+          ...cookieArgs('youtube'),
           searchUrl,
           '--dump-json',
           '--no-download',
@@ -230,7 +259,7 @@ export class YouTube {
         .map(line => { try { return JSON.parse(line); } catch { return null; } })
         .filter(Boolean);
     } catch (error) {
-      console.error('YouTube Music album search error:', error.message);
+      console.error('YouTube Music album search error:', redactExternalError(error));
       return null;
     }
 
@@ -262,17 +291,11 @@ export class YouTube {
   }
 
   static isYouTubeUrl(url) {
-    const patterns = [
-      /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/,
-      /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?v=.+$/,
-      /^(https?:\/\/)?youtu\.be\/.+$/,
-      /^(https?:\/\/)?(www\.)?youtube\.com\/playlist\?list=.+$/
-    ];
-    return patterns.some(pattern => pattern.test(url));
+    return Boolean(parseYouTubeUrl(url));
   }
 
   static isPlaylist(url) {
-    return url.includes('playlist?list=');
+    return parseYouTubeUrl(url, { allowPlaylist: true })?.kind === 'playlist';
   }
 
   static formatDuration(seconds) {

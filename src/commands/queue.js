@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { musicQueue } from '../utils/player.js';
 import { describeStyle } from '../utils/radio.js';
+import { requireGuild } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('queue')
@@ -13,6 +14,7 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
+  if (!(await requireGuild(interaction))) return;
   const serverQueue = musicQueue.peek(interaction.guild.id);
 
   if (!serverQueue || (!serverQueue.currentSong && serverQueue.songs.length === 0 && serverQueue.radioQueue.length === 0)) {

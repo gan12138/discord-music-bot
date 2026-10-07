@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { refreshNowPlayingPanel } from '../utils/playerPanel.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 export const data = new SlashCommandBuilder()
   .setName('loop')
@@ -17,19 +18,23 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
+  if (!(await requireMusicAccess(interaction, { requireVoice: true, requireBotInVoice: true }))) return;
+  await interaction.deferReply({ flags: 64 });
   const serverQueue = musicQueue.peek(interaction.guild.id);
 
   if (!serverQueue || !serverQueue.playing) {
-    return interaction.reply('❌ 当前没有正在播放的歌曲！');
+    return interaction.editReply('❌ 当前没有正在播放的歌曲！');
   }
 
   const voiceChannel = interaction.member.voice.channel;
   if (!voiceChannel || voiceChannel.id !== interaction.guild.members.me.voice.channel?.id) {
-    return interaction.reply('❌ 你需要和我在同一个语音频道！');
+    return interaction.editReply('❌ 你需要和我在同一个语音频道！');
   }
 
   const mode = interaction.options.getString('mode');
-  MusicPlayer.setLoop(interaction.guild.id, mode);
+  if (!MusicPlayer.setLoop(interaction.guild.id, mode)) {
+    return interaction.editReply('❌ 循环模式设置失败。');
+  }
   await refreshNowPlayingPanel(interaction.guild.id, interaction.channel, serverQueue);
 
   const modeNames = {
@@ -38,5 +43,5 @@ export async function execute(interaction) {
     'queue': '列表循环'
   };
 
-  await interaction.reply(`🔁 循环模式已设置为: ${modeNames[mode]}`);
+  await interaction.editReply(`🔁 循环模式已设置为: ${modeNames[mode]}`);
 }

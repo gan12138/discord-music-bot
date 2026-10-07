@@ -161,7 +161,7 @@ async function createAIPlan(prompt, preference) {
         },
       }),
     },
-  ], { temperature: 0.5 });
+  ], { temperature: 0.5, feature: 'ai-music' });
 
   const plan = unwrapAIPlan(result);
   const songs = normalizeSongSuggestions(plan?.songs || plan?.tracks || plan?.recommendations);

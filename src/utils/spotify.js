@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ytdlpSemaphore } from './shared.js';
+import { parseSpotifyUrl, redactExternalError } from './urlAllowlist.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_SPOTIFY_ITEMS = 50;
@@ -9,23 +10,20 @@ const YTDLP_COMMON = ['--js-runtimes', 'node'];
 
 export class SpotifyHandler {
   static isSpotifyUrl(url) {
-    const patterns = [
-      /^https?:\/\/open\.spotify\.com\/track\/.+$/,
-      /^https?:\/\/open\.spotify\.com\/album\/.+$/,
-      /^https?:\/\/open\.spotify\.com\/playlist\/.+$/
-    ];
-    return patterns.some(pattern => pattern.test(url));
+    return Boolean(parseSpotifyUrl(url));
   }
 
   static async getTrack(url) {
     try {
+      const parsed = parseSpotifyUrl(url);
+      if (!parsed || parsed.type !== 'track') return null;
       // 用 yt-dlp 获取 Spotify 曲目元数据
       await ytdlpSemaphore.acquire();
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          url,
+          parsed.canonicalUrl,
           '--dump-json',
           '--no-download',
           '--flat-playlist',
@@ -41,7 +39,7 @@ export class SpotifyHandler {
         searchQuery: `${data.title || data.track} ${data.artist || data.uploader || ''}`
       };
     } catch (error) {
-      console.error('Spotify track error:', error.message);
+      console.error('Spotify track error:', redactExternalError(error));
       // 回退：从 URL 中无法获取信息时返回 null
       return null;
     }
@@ -49,15 +47,18 @@ export class SpotifyHandler {
 
   static async _getCollection(url, label = 'collection') {
     try {
+      const parsed = parseSpotifyUrl(url);
+      if (!parsed || !['album', 'playlist'].includes(parsed.type)) return null;
       await ytdlpSemaphore.acquire();
       let stdout;
       try {
         ({ stdout } = await execFileAsync('yt-dlp', [
           ...YTDLP_COMMON,
-          url,
+          parsed.canonicalUrl,
           '--dump-json',
           '--no-download',
           '--flat-playlist',
+          '--playlist-end', String(MAX_SPOTIFY_ITEMS),
         ], { timeout: 30000 }));
       } finally {
         ytdlpSemaphore.release();
@@ -75,7 +76,7 @@ export class SpotifyHandler {
           };
         });
     } catch (error) {
-      console.error(`Spotify ${label} error:`, error.message);
+      console.error(`Spotify ${label} error:`, redactExternalError(error));
       return null;
     }
   }

@@ -3,6 +3,7 @@ import { musicQueue, MusicPlayer } from '../utils/player.js';
 import { PlaybackState } from '../models/database.js';
 import { initLavalink, isLavalinkEnabled, waitForLavalinkReady } from '../utils/lavalink.js';
 import { hydrateQueue, savePlaybackState } from '../utils/playbackState.js';
+import { refreshNowPlayingPanel } from '../utils/playerPanel.js';
 
 export const name = Events.ClientReady;
 export const once = true;
@@ -32,20 +33,16 @@ export async function execute(client) {
     const serverQueue = musicQueue.get(guildId);
     hydrateQueue(serverQueue, state);
 
-    if (isLavalinkEnabled() && serverQueue.currentSong?.source === 'radio') {
-      serverQueue.currentSong = null;
-      serverQueue.playing = false;
-      serverQueue.seekOffsetSeconds = 0;
-      serverQueue.startedAt = null;
-      serverQueue.pausedAt = null;
-      serverQueue.suppressRadioUntilManualPlay = true;
-      savePlaybackState(guildId, serverQueue, { immediate: true });
-    }
-
     const guild = client.guilds.cache.get(guildId);
     if (!guild) continue;
 
     serverQueue.textChannel = state.textChannelId ? await guild.channels.fetch(state.textChannelId).catch(() => null) : null;
+
+    if (serverQueue.notificationMode === 'panel' && serverQueue.currentSong) {
+      await refreshNowPlayingPanel(guildId, serverQueue.textChannel, serverQueue).catch(error => {
+        console.warn(`[Recovery] guild ${guildId} panel refresh failed:`, error.message);
+      });
+    }
 
     const voiceChannel = state.voiceChannelId ? await guild.channels.fetch(state.voiceChannelId).catch(() => null) : null;
     if (!voiceChannel || !voiceChannel.isVoiceBased()) {
@@ -57,28 +54,69 @@ export async function execute(client) {
     }
 
     try {
-      serverQueue.connection = await MusicPlayer.joinVoice(voiceChannel, guildId, guild.voiceAdapterCreator);
-
-      // 频道无人时只保持连接，不播放，不触发 radio/AI
       const humanCount = voiceChannel.members.filter(m => !m.user.bot).size;
-      if (humanCount === 0) {
+      serverQueue.voiceChannelId = voiceChannel.id;
+      serverQueue.voiceChannelRef = voiceChannel;
+      serverQueue.guildRef = guild;
+
+      if (!serverQueue.is247 && humanCount === 0) {
         serverQueue.pausedByEmptyChannel = true;
         savePlaybackState(guildId, serverQueue, { immediate: true });
         continue;
       }
 
+      if (isLavalinkEnabled() && !lavalinkReady) {
+        serverQueue.backendUnavailable = true;
+        serverQueue.playbackBlocked = true;
+        serverQueue.pendingRecovery = {
+          guildId,
+          playbackId: serverQueue.playbackId,
+          reason: 'Lavalink 启动延迟',
+          at: Date.now(),
+        };
+        MusicPlayer.scheduleLavalinkRecovery(guildId, serverQueue);
+        savePlaybackState(guildId, serverQueue, { immediate: true });
+        continue;
+      }
+
+      serverQueue.connection = await MusicPlayer.joinVoice(voiceChannel, guildId, guild.voiceAdapterCreator);
+
       serverQueue.pausedByEmptyChannel = false;
       savePlaybackState(guildId, serverQueue, { immediate: true });
-      if (serverQueue.currentSong && serverQueue.textChannel && (!isLavalinkEnabled() || lavalinkReady)) {
-        await MusicPlayer.playSong(guildId, serverQueue.textChannel, serverQueue.currentSong, serverQueue.currentSong.source || 'manual', {
-          seekSeconds: serverQueue.seekOffsetSeconds || 0,
+      if (serverQueue.currentSong && (!isLavalinkEnabled() || lavalinkReady)) {
+        await MusicPlayer.ensurePlaybackOutput(guildId, 'startup-restore', { force: true });
+        await refreshNowPlayingPanel(guildId, serverQueue.textChannel, serverQueue).catch(error => {
+          console.warn(`[Recovery] guild ${guildId} panel refresh after playback restore failed:`, error.message);
         });
-      } else if (serverQueue.currentSong && isLavalinkEnabled() && !lavalinkReady) {
-        serverQueue.playing = false;
-        savePlaybackState(guildId, serverQueue, { immediate: true });
+      } else if (!serverQueue.currentSong
+        && (serverQueue.songs.length > 0 || serverQueue.radioQueue.length > 0 || serverQueue.radio?.enabled)
+        && (!isLavalinkEnabled() || lavalinkReady)) {
+        await MusicPlayer.playSong(guildId, serverQueue.textChannel || null);
       }
     } catch (error) {
       console.error(`[Recovery] guild ${guildId} 恢复失败:`, error.message);
+      if (serverQueue.is247 && !serverQueue.connection) {
+        serverQueue.backendUnavailable = true;
+        serverQueue.playbackBlocked = true;
+        serverQueue.pendingRecovery = {
+          guildId,
+          playbackId: serverQueue.playbackId,
+          reason: error.message || '启动语音连接失败',
+          at: Date.now(),
+        };
+        const retryAt = Number(error.retryAt) || 0;
+        if (error.code === 'VOICE_JOIN_BLOCKED' && retryAt > Date.now()) {
+          MusicPlayer.scheduleVoiceRecovery(
+            guildId,
+            serverQueue,
+            'communication-timeout-expired',
+            retryAt - Date.now() + 1_000,
+          );
+        } else {
+          MusicPlayer.scheduleLavalinkRecovery(guildId, serverQueue, 60_000);
+        }
+        savePlaybackState(guildId, serverQueue, { immediate: true });
+      }
     }
   }
 }

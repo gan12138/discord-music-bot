@@ -6,6 +6,7 @@ import { YouTube } from '../utils/youtube.js';
 import { SpotifyHandler } from '../utils/spotify.js';
 import { addSongsToPlayback } from '../utils/playback.js';
 import { savePlaybackState } from '../utils/playbackState.js';
+import { requireMusicAccess } from '../utils/commandSafety.js';
 
 const PLAY_TIMING = process.env.PLAY_TIMING === '1';
 
@@ -25,6 +26,7 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction) {
   const t0 = Date.now();
   console.log(`[play] execute start, interaction age: ${t0 - interaction.createdTimestamp}ms`);
+  if (!(await requireMusicAccess(interaction, { requireVoice: true }))) return;
   try {
     await interaction.deferReply({ flags: 64 });
     console.log(`[play] deferReply ok, took: ${Date.now() - t0}ms`);
@@ -46,7 +48,7 @@ export async function execute(interaction) {
   }
 
   let songs = [];
-  let queueStartLength = null;
+  let queuedItemIds = [];
 
   try {
     if (SpotifyHandler.isSpotifyUrl(query)) {
@@ -90,21 +92,24 @@ export async function execute(interaction) {
         // 对单个 YouTube URL，并行获取视频信息和加入语音频道以减少延迟
         const voiceNeedsJoin = voiceChannel && !musicQueue.peek(interaction.guild.id)?.connection;
         const infoPromise = YouTube.getVideoInfo(query);
-        let earlyJoinPromise = null;
+        let video;
         if (voiceNeedsJoin) {
-          earlyJoinPromise = MusicPlayer.joinVoice(
-            voiceChannel,
-            interaction.guild.id,
-            interaction.guild.voiceAdapterCreator
-          );
-        }
-        const video = await infoPromise;
-        timingLog(t0, 'youtube video info loaded');
-        if (earlyJoinPromise) {
+          const [loadedVideo, connection] = await Promise.all([
+            infoPromise,
+            MusicPlayer.joinVoice(
+              voiceChannel,
+              interaction.guild.id,
+              interaction.guild.voiceAdapterCreator
+            ),
+          ]);
+          video = loadedVideo;
           const sq = musicQueue.get(interaction.guild.id);
-          sq.connection = await earlyJoinPromise;
+          sq.connection = connection;
           timingLog(t0, 'early joinVoice completed');
+        } else {
+          video = await infoPromise;
         }
+        timingLog(t0, 'youtube video info loaded');
         if (video) {
           songs.push(video);
         }
@@ -155,14 +160,17 @@ export async function execute(interaction) {
     }
 
     const serverQueue = musicQueue.get(interaction.guild.id);
-    queueStartLength = serverQueue.songs.length;
+    queuedItemIds = songs
+      .map(song => MusicPlayer.ensureQueueItemId(song)?.queueItemId)
+      .filter(Boolean);
     await addSongsToPlayback(interaction, songs, { editReply: true });
     timingLog(t0, 'play command completed');
   } catch (error) {
     console.error('Play command error:', error);
     const serverQueue = musicQueue.peek(interaction.guild.id);
-    if (typeof queueStartLength === 'number') {
-      serverQueue?.songs.splice(queueStartLength, songs.length);
+    if (serverQueue && queuedItemIds.length) {
+      MusicPlayer.removeQueueItemsById(serverQueue, queuedItemIds);
+      savePlaybackState(interaction.guild.id, serverQueue, { immediate: true });
     }
     if (serverQueue && !serverQueue.playing && serverQueue.songs.length === 0) {
       if (serverQueue.is247) {
