@@ -14,11 +14,27 @@
 
 先在 Discord Developer Portal 创建音乐 Bot，用 `bot`、`applications.commands` scope 邀请到服务器，授予语音查看/连接/说话和文字发送/嵌入链接权限。
 
+当前仓库的匿名 GitHub/raw 下载返回 404，需有仓库读取权限。推荐服务器配置 GitHub SSH key 后执行（需要预先有 `git`、`python3`）：
+
+```bash
+work=$(mktemp -d) && git clone --depth=1 git@github.com:gan12138/discord-music-bot.git "$work/source" && sudo bash "$work/source/scripts/install.sh" --source "$work/source"
+```
+
+此方式用当前用户的 SSH key 获取代码，再由 sudo 安装；GitHub key 不交给 root，也不需要在命令里填写 API Token。安装完成后临时源码目录可删除。
+
+**只有仓库开放公开读取时**，以下匿名入口才可用：
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gan12138/discord-music-bot/main/scripts/install.sh | sudo bash
 ```
 
-需要时可以先下载脚本查看或仅检查系统：
+在已授权的源码目录中可先检查系统：
+
+```bash
+bash scripts/install.sh --check
+```
+
+公开仓库也可先下载脚本查看：
 
 ```bash
 curl -fsSL -o /tmp/musicbot-install.sh https://raw.githubusercontent.com/gan12138/discord-music-bot/main/scripts/install.sh

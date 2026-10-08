@@ -18,11 +18,13 @@
 
 支持 **Ubuntu 22.04/24.04、Debian 12/13，amd64/arm64**，需要有 sudo 权限的服务器和交互式终端。
 
-先创建并邀请 Discord Bot，然后在服务器执行：
+先创建并邀请 Discord Bot。**当前仓库需 GitHub 访问授权**，服务器已配置有权限的 SSH key 时执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gan12138/discord-music-bot/main/scripts/install.sh | sudo bash
+work=$(mktemp -d) && git clone --depth=1 git@github.com:gan12138/discord-music-bot.git "$work/source" && sudo bash "$work/source/scripts/install.sh" --source "$work/source"
 ```
+
+若仓库开放公开访问，也可使用 `curl` 单行入口，见 [安装命令](docs/installation.md#运行命令)。
 
 向导会隐藏输入 Token，询问应用 ID、服务器 ID、可选 Cookie 路径和 AI 配置，自动安装 **Node、Java、Lavalink、ffmpeg、yt-dlp/EJS、YouTube 辅助服务**，部署命令并设置开机启动。
 

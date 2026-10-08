@@ -62,5 +62,8 @@ if ! command -v python3 >/dev/null || ! command -v git >/dev/null; then
 fi
 STAGING=$(mktemp -d /tmp/discord-music-bot-bootstrap.XXXXXXXX)
 trap 'rm -rf -- "$STAGING"' EXIT
-GIT_TERMINAL_PROMPT=0 git clone --depth=1 --single-branch --branch "$REF" "$REPOSITORY" "$STAGING/source"
+if ! GIT_TERMINAL_PROMPT=0 git clone --depth=1 --single-branch --branch "$REF" "$REPOSITORY" "$STAGING/source"; then
+  printf 'Repository is not anonymously accessible. Use an SSH-authorized checkout and --source.\n' >&2
+  exit 1
+fi
 python3 "$STAGING/source/scripts/install.py" --source "$STAGING/source"
