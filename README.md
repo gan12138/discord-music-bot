@@ -1,6 +1,6 @@
 # 🎵 Discord Music Bot
 
-支持 YouTube、Bilibili 和 Spotify 歌曲解析的 Discord 音乐机器人，提供自动续播、AI 点歌和可选语音控制。
+支持 YouTube、Bilibili 歌曲解析的 Discord 音乐机器人，提供自动续播、AI 点歌和可选语音控制。
 
 当前版本 **2.0.0** · [更新记录](CHANGELOG.md)
 
@@ -14,7 +14,6 @@
 - 🔄 播放失败自动重试与备用播放
 - 🕒 24/7 语音频道保持
 
-Spotify 内容会转换为 YouTube 搜索结果播放。
 
 ## 快速开始
 
