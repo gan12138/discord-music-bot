@@ -1,5 +1,7 @@
 # systemd Deployment
 
+[Project home](../README.md) · [Configuration](../docs/configuration.md) · [Troubleshooting](../docs/troubleshooting.md)
+
 The unit files are production deployment templates. They assume:
 
 - the application is installed at `/opt/discord-music-bot`;
