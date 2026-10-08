@@ -1,0 +1,13 @@
+.git
+node_modules
+.env
+.env.*
+!.env.example
+**/*.env
+**/*cookie*.txt
+**/*cookie*.json
+data
+logs
+*.log
+**/__pycache__
+**/*.pyc

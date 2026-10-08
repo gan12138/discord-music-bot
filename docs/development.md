@@ -14,6 +14,8 @@ src/utils/playback.js      共用入队逻辑
 src/utils/playbackState.js 播放状态持久化
 test/                     隔离的 Node 测试
 docs/                     使用、配置和排查文档
+scripts/install.sh        交互式安装入口
+scripts/install.py        安装、私有配置与失败恢复
 lavalink/application.yml   Lavalink 配置
 ```
 
@@ -36,6 +38,7 @@ lavalink/application.yml   Lavalink 配置
 ```bash
 npm run check
 npm test
+python3 -B -m unittest discover -s test -p 'installer_test.py' -v
 ```
 
 没有项目定义的 lint、format 或 typecheck 脚本。`npm start`、命令部署、STT 探测涉及真实服务，不能当作纯离线验证。

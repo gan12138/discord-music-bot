@@ -33,6 +33,7 @@
 - `src/index.js` sets `globalThis.File = File` from `node:buffer` before importing Discord code; keep this compatibility shim unless the dependency/runtime issue is verified gone.
 - Cloud voice STT defaults to `voiceControl.sttAccessMode: everyone` for all existing and future guilds. Every human member in the main music Bot's channel may use all voice commands without role, requester, or consent-list checks; `sttOptOutUserIds` remains the only per-member exclusion. `off` disables STT for the guild. Mode or opt-out changes must invalidate and abort current voice work.
 - AI requires an explicit public HTTPS `AI_BASE_URL`; there is no default private relay. Tests use reserved example endpoints and injected requests.
+- `scripts/install.sh` bootstraps `scripts/install.py` for Ubuntu/Debian servers. Do not run the full installer on a live host for validation; use `--check`, mocked Python tests, or disposable Docker/VM environments. Installer-managed private state lives under `/etc/discord-music-bot` and `/var/lib`, outside the source checkout. Cookie files must remain writable by yt-dlp and helper ports must stay localhost-only.
 
 ## Playback Architecture Notes
 - `src/utils/player.js` owns queue advancement, Lavalink playback, local fallback, and control routing.
@@ -51,6 +52,7 @@
 - `npm run deploy` requires real credentials and mutates Discord application commands; do not run it as a harmless validation step.
 - For safe syntax/import checks, prefer targeted `node --check <file>` or dynamic imports that avoid logging in.
 - `npm run check` is the safe whole-project syntax check.
+- Installer tests: `python3 -B -m unittest discover -s test -p 'installer_test.py' -v`; shell checks: `bash -n scripts/install.sh scripts/youtube-helpers.sh`. `test/installer.Dockerfile` isolates real dependency installation; never mount a host Docker socket or use actual Discord credentials in it.
 - Safe Bilibili parser verification can use a dynamic import of `Bilibili.getVideoInfo()` after loading `dotenv/config`; this does not log in to Discord.
 - Do not run `npm run deploy` or restart a running Bot unless explicitly requested. Verify the exact process working directory before terminating it; multiple Bot installations may be running on the same host.
 - After changing playback routing, test or ask the user to test these flows: YouTube pause/resume/skip, Bilibili pause/resume/skip, YouTube -> Bilibili next, and Bilibili -> YouTube next.

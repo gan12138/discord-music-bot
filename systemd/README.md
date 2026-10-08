@@ -2,6 +2,10 @@
 
 [Project home](../README.md) · [Configuration](../docs/configuration.md) · [Troubleshooting](../docs/troubleshooting.md)
 
+For automatic installation on Ubuntu/Debian, use the [interactive installer](../docs/installation.md).
+It generates dedicated `discord-music-bot-lavalink` / `discord-music-bot-youtube`
+units and private runtime directories. The generic templates below are for manual deployments.
+
 The unit files are production deployment templates. They assume:
 
 - the application is installed at `/opt/discord-music-bot`;

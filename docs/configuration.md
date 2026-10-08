@@ -2,6 +2,8 @@
 
 [返回首页](../README.md) · [使用指南](usage.md) · [语音控制](voice-control.md) · [故障排查](troubleshooting.md)
 
+希望自动安装 Bot、Lavalink 和依赖时，先看 [一键安装](installation.md)。以下 `.env` 步骤用于手动启动；一键部署请编辑 `/etc/discord-music-bot/bot.env`。
+
 ## 运行要求
 
 - Node.js `>=22.12.0`。

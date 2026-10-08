@@ -4,6 +4,8 @@
 
 以下命令用于手动排查。原始日志可能包含 Token、Cookie、签名音频 URL 和用户标识，分享前需脱敏。
 
+一键部署使用 `discord-music-bot-lavalink` 服务名（不是手动模板的 `lavalink`），配置位于 `/etc/discord-music-bot/bot.env`。下面的日志命令适用于手动模板；一键部署请按 [服务管理](installation.md#服务管理) 替换对应服务名。
+
 ## 日志与进程
 
 systemd 部署优先查看：
