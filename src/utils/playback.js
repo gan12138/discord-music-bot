@@ -8,10 +8,22 @@ function timingLog(startedAt, step) {
   if (PLAY_TIMING && startedAt) console.log(`[play timing] ${step}: ${Date.now() - startedAt}ms`);
 }
 
-export async function enqueueSongs({ guild, voiceChannel, textChannel, requester, songs, waitForStart = false }) {
+export async function enqueueSongs({
+  guild,
+  voiceChannel,
+  textChannel,
+  requester,
+  songs,
+  waitForStart = false,
+  signal = null,
+  validateOperation = null,
+}) {
   const startedAt = PLAY_TIMING ? Date.now() : null;
   if (!voiceChannel) {
     throw new Error('你需要先加入语音频道');
+  }
+  if (!MusicPlayer.operationIsValid({ signal, validateOperation })) {
+    return { ok: false, reason: 'stale', serverQueue: null, addedSongs: [], shouldStartPlayback: false, startedPlayback: false };
   }
 
   const permissions = voiceChannel.permissionsFor(guild.members.me);
@@ -20,8 +32,22 @@ export async function enqueueSongs({ guild, voiceChannel, textChannel, requester
   }
 
   const queueSongs = Array.isArray(songs) ? songs : [];
+  const operationOptions = { signal, validateOperation };
   return MusicPlayer.runTransition(guild.id, async () => {
     const serverQueue = musicQueue.get(guild.id);
+    // The operation may have been revoked while this call waited for the
+    // guild lock (voice opt-out, STT off, stop). Recheck before any mutation.
+    if (!MusicPlayer.operationIsValid(operationOptions)) {
+      return {
+        ok: false,
+        reason: 'stale',
+        operationId: null,
+        serverQueue,
+        addedSongs: [],
+        shouldStartPlayback: false,
+        startedPlayback: false,
+      };
+    }
     const botChannelId = guild.members.me?.voice?.channelId || serverQueue.voiceChannelId || serverQueue.connection?.joinConfig?.channelId;
     if (botChannelId && botChannelId !== voiceChannel.id) {
       throw new Error('你需要和我在同一个语音频道');
@@ -90,6 +116,7 @@ export async function enqueueSongs({ guild, voiceChannel, textChannel, requester
           voiceChannel,
           guild.id,
           guild.voiceAdapterCreator,
+          { signal },
         );
         timingLog(startedAt, 'joinVoice completed');
       } catch (error) {
@@ -116,6 +143,35 @@ export async function enqueueSongs({ guild, voiceChannel, textChannel, requester
       }
     }
 
+    // Revocation may have happened while joinVoice/playSong startup was in
+    // flight. Roll back exactly what this operation added instead of leaving
+    // a song or a fresh voice connection behind.
+    if (!MusicPlayer.operationIsValid(operationOptions)) {
+      if (serverQueue.startReservation === operationId) serverQueue.startReservation = null;
+      const addedIds = new Set(queuedSongs.map(song => song.queueItemId));
+      MusicPlayer.removeQueueItemsById(serverQueue, [...addedIds]);
+      // Do not cut a song that is already audible, but never leave this
+      // command's half-started track as the current song.
+      if (!MusicPlayer.isPlaybackActuallyActive(serverQueue)
+        && serverQueue.currentSong && addedIds.has(serverQueue.currentSong.queueItemId)) {
+        MusicPlayer.clearFinishedCurrentSong(serverQueue, { remember: false });
+      }
+      savePlaybackState(guild.id, serverQueue, { immediate: true });
+      if (!serverQueue.currentSong && serverQueue.songs.length === 0
+        && serverQueue.radioQueue.length === 0 && !serverQueue.is247) {
+        await MusicPlayer.clearQueueAndLeave(guild.id, 'voice-command-cancelled', { notify: false });
+      }
+      return {
+        ok: false,
+        reason: 'stale',
+        operationId,
+        serverQueue,
+        addedSongs: [],
+        shouldStartPlayback: false,
+        startedPlayback: false,
+      };
+    }
+
     if (shouldStartPlayback && !serverQueue.backendUnavailable) {
       try {
         const currentBotChannelId = guild.members.me?.voice?.channelId
@@ -125,7 +181,7 @@ export async function enqueueSongs({ guild, voiceChannel, textChannel, requester
           MusicPlayer.removeQueueItemsById(serverQueue, queuedSongs.map(song => song.queueItemId));
           throw new Error('你需要和我在同一个语音频道');
         }
-        const result = await MusicPlayer.playSong(guild.id, textChannel || serverQueue.textChannel);
+        const result = await MusicPlayer.playSong(guild.id, textChannel || serverQueue.textChannel, null, null, operationOptions);
         if (result?.reason === 'backend-unavailable') {
           return {
             ok: true,

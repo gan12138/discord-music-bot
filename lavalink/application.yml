@@ -52,14 +52,14 @@ plugins:
     remoteCipher:
       url: "http://127.0.0.1:8001"
       userAgent: "discord-music-bot"
-    # OAuth：TV 客户端是插件中唯一支持 OAuth 的客户端，用 burner 账号登录后
-    # 绕过 poToken/SABR 限制。refreshToken 存放于 lavalink.env（权限 600、已 gitignore）。
+    # OAuth：TV 客户端是插件中唯一支持 OAuth 的客户端，登录后
+    # 可绕过 poToken/SABR 限制。refreshToken 存放在私有环境文件，不要提交到仓库。
     # 重新授权：清空 YOUTUBE_OAUTH_REFRESH_TOKEN 后重启，按日志中的配对码重新授权。
     oauth:
       enabled: true
       refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
-    # 客户端说明（2026-08 实测）：
-    # TV 必须排在播放链最前，它是唯一支持 OAuth 的客户端，靠 burner 账号登录
+    # 客户端说明：
+    # TV 必须排在播放链最前，它是唯一支持 OAuth 的客户端，登录后可
     # 绕过 YouTube 的 poToken/SABR 限制；其余客户端仅作兜底，实际都已失效：
     # WEB/WEBEMBEDDED 因 YouTube 把 GVS poToken 绑定到具体 video ID 而只拿到
     # SABR-only 响应（有 itag 但无 url），ANDROID_VR/TVHTML5_SIMPLY/MWEB 分别被

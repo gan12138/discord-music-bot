@@ -65,7 +65,6 @@ const VOICE_TRANSITION_SETTLE_MS = 3_000;
 const MAX_TIMER_MS = 2_147_000_000;
 const VOICE_JOIN_BLOCKED_CODE = 'VOICE_JOIN_BLOCKED';
 const DISCORD_CONTENT_MAX_LENGTH = 2000;
-
 const guildOperationContext = new AsyncLocalStorage();
 
 function debugLog(...args) {
@@ -382,16 +381,21 @@ export class MusicPlayer {
 
     const sequence = (Number(serverQueue.transitionSequence) || 0) + 1;
     serverQueue.transitionSequence = sequence;
-    const scope = { guildId, sequence, queue: serverQueue, active: true };
+    const scope = { guildId, sequence, queue: serverQueue, active: false };
     const run = Promise.resolve(serverQueue.transitionTail)
       .catch(() => {})
       .then(() => guildOperationContext.run(scope, async () => {
+        scope.active = true;
         try {
           return await operation();
         } finally {
+          // Detached async work inherits the scope but must acquire a fresh
+          // slot after its owning operation finishes.
           scope.active = false;
         }
       }));
+    // Only completion releases the slot. A timeout cannot cancel arbitrary
+    // mutation, so force-releasing here would break guild mutual exclusion.
     serverQueue.transitionTail = run.catch(() => {});
     return run;
   }
@@ -399,6 +403,68 @@ export class MusicPlayer {
   static inTransition(guildId) {
     const context = guildOperationContext.getStore();
     return context?.guildId === guildId && context.active;
+  }
+
+  // Recheck after acquiring the guild lock, not only before queueing work.
+  static operationIsValid({ signal, validateOperation } = {}) {
+    return !signal?.aborted && (!validateOperation || validateOperation() === true);
+  }
+
+  static bindStartupCancellation(serverQueue, playbackId, { signal } = {}) {
+    if (!signal) return () => {};
+    const abort = () => {
+      if (this.isCurrentPlayback(serverQueue, playbackId)) {
+        serverQueue.playbackAttemptController?.abort(signal.reason);
+      }
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    // The command owns startup only. Finishing a command must not cancel the
+    // successfully started song when its command controller is disposed.
+    return () => signal.removeEventListener('abort', abort);
+  }
+
+  static preservePausedPlayback(guildId, serverQueue) {
+    const playbackId = serverQueue.playbackId;
+    const player = serverQueue.player;
+    if (!player || !this.isCurrentPlayback(serverQueue, playbackId)) return false;
+    // Already paused (resource rebuild kept the state): nothing to do.
+    if (player.state.status === AudioPlayerStatus.Paused) {
+      markPlaybackPaused(serverQueue);
+      this.setSongPausedState(serverQueue, true);
+      serverQueue.playing = false;
+      savePlaybackState(guildId, serverQueue, { immediate: true });
+      return true;
+    }
+    this.applyPauseWhenPlaying(player, serverQueue, guildId, playbackId);
+    return true;
+  }
+
+  // A paused song rebuilt through seek/filter must not start playing just
+  // because the new resource arrived later than the prebuffer window.
+  // @discordjs/voice only accepts pause() while Playing, so hold the pause
+  // intent until the player reports Playing, then apply it exactly once.
+  static applyPauseWhenPlaying(localPlayer, serverQueue, guildId, playbackId) {
+    if (!localPlayer?.on) return false;
+    const tryPause = () => {
+      if (!this.isCurrentPlayback(serverQueue, playbackId)) {
+        localPlayer.off('stateChange', onState);
+        return false;
+      }
+      if (localPlayer.state.status !== AudioPlayerStatus.Playing) return false;
+      localPlayer.off('stateChange', onState);
+      if (localPlayer.pause(true) === false) return false;
+      markPlaybackPaused(serverQueue);
+      this.setSongPausedState(serverQueue, true);
+      serverQueue.playing = false;
+      savePlaybackState(guildId, serverQueue, { immediate: true });
+      return true;
+    };
+    const onState = (_oldState, newState) => {
+      if (newState.status === AudioPlayerStatus.Playing) tryPause();
+    };
+    localPlayer.on('stateChange', onState);
+    return tryPause();
   }
 
   static queueItemId(song = null) {
@@ -1884,6 +1950,7 @@ export class MusicPlayer {
   }
 
   static async playSong(guildId, textChannel, explicitSong = null, explicitSource = null, options = {}) {
+    if (!this.operationIsValid(options)) return { ok: false, reason: 'stale' };
     if (!this.inTransition(guildId)) {
       if (explicitSong && !options.recoverySession) this.interruptPlaybackRecovery(guildId);
       return this.runTransition(guildId, () => this.playSong(guildId, textChannel, explicitSong, explicitSource, options));
@@ -2036,6 +2103,7 @@ export class MusicPlayer {
     }
     serverQueue.currentSong = song;
     const attemptSignal = this.beginPlaybackAttempt(guildId, serverQueue, song, options);
+    const unbindStartupCancellation = this.bindStartupCancellation(serverQueue, playbackId, options);
     ensurePanelRevision(serverQueue, song);
     serverQueue.streamDiagnostics = null;
     serverQueue.playing = false;
@@ -2324,6 +2392,20 @@ export class MusicPlayer {
         debugLog('[DEBUG] playback superseded during prebuffer, aborting play');
         return;
       }
+      if (!this.operationIsValid(options) || attemptSignal.aborted) {
+        // The command was revoked while the source was buffering. Do not start
+        // audio that nobody is waiting for; drop its processes and song.
+        this.cleanupLocalProcesses(serverQueue);
+        serverQueue.audioResource = null;
+        this.removeQueueItemsById(serverQueue, [song.queueItemId]);
+        this.releaseReservedSong(serverQueue, song);
+        serverQueue.currentSong = previousSong;
+        serverQueue.playing = previousPlaying;
+        serverQueue.activeBackend = previousBackend;
+        serverQueue.startingBackend = null;
+        savePlaybackState(guildId, serverQueue, { immediate: true });
+        return { ok: false, reason: 'stale' };
+      }
       if (serverQueue.player !== localPlayer) {
         debugLog('[DEBUG] local player was replaced during prebuffer, aborting play');
         return;
@@ -2412,10 +2494,13 @@ export class MusicPlayer {
       this.advance(guildId, serverQueue).catch(recoveryError => {
         console.error('[Player] advance after local playback error failed:', safeErrorMessage(recoveryError));
       });
+    } finally {
+      unbindStartupCancellation();
     }
   }
 
   static async playSongLavalink(guildId, textChannel, explicitSong = null, explicitSource = null, options = {}) {
+    if (!this.operationIsValid(options)) return { ok: false, reason: 'stale' };
     if (!this.inTransition(guildId)) {
       return this.runTransition(guildId, () => this.playSongLavalink(guildId, textChannel, explicitSong, explicitSource, options));
     }
@@ -2569,6 +2654,7 @@ export class MusicPlayer {
     }
     serverQueue.currentSong = song;
     const attemptSignal = this.beginPlaybackAttempt(guildId, serverQueue, song, options);
+    const unbindStartupCancellation = this.bindStartupCancellation(serverQueue, playbackId, options);
     serverQueue.streamDiagnostics = { playbackId, inputMode: 'lavalink', startPositionSeconds: recoverySeekSeconds };
     serverQueue.playing = false;
     serverQueue.stallWatchdogConsecutive = 0;
@@ -2683,6 +2769,7 @@ export class MusicPlayer {
       this.releaseReservedSong(serverQueue, song);
       await this.advance(guildId, serverQueue);
     } finally {
+      unbindStartupCancellation();
       this.resetLavalinkStart(serverQueue, startKey);
     }
   }
@@ -2849,11 +2936,23 @@ export class MusicPlayer {
         || serverQueue.connection?.type === 'lavalink';
       if (!usesLavalink) continue;
       const player = getLavalinkPlayer(guildId);
-      if (serverQueue.currentSong && activeBackend === 'lavalink') {
-        const positionSeconds = Number(player?.position) > 0
-          ? Number(player.position) / 1000
+      if (serverQueue.currentSong) {
+        // A disconnected node is no longer 'active' according to the health
+        // check. Freeze at the last confirmed server position; when output was
+        // never confirmed, fall back to the elapsed playback clock so an outage
+        // is never counted as played audio.
+        const wasPaused = Boolean(serverQueue.pausedAt || serverQueue.currentSong.playbackPaused);
+        const confirmedPositionMs = serverQueue.streamDiagnostics?.outputConfirmed
+          ? Number(player?.lastPosition ?? serverQueue.streamDiagnostics?.confirmedPositionMs)
+          : NaN;
+        const positionSeconds = Number.isFinite(confirmedPositionMs) && confirmedPositionMs >= 0
+          ? confirmedPositionMs / 1000
           : getPlaybackProgressSeconds(serverQueue);
         freezePlaybackProgress(serverQueue, positionSeconds);
+        if (wasPaused) {
+          serverQueue.pausedAt = Date.now();
+          this.setSongPausedState(serverQueue, true);
+        }
       }
       serverQueue.playing = false;
       serverQueue.activeBackend = null;
@@ -3159,16 +3258,21 @@ export class MusicPlayer {
     serverQueue.pausedAt = null;
     serverQueue.pausedByEmptyChannel = false;
 
-    if (isLavalinkEnabled() && !(serverQueue.is247 && keepConnectionFor247)) {
-      await destroyLavalinkPlayer(guildId, reason);
-      serverQueue.connection = null;
-    } else if (serverQueue.connection && !(serverQueue.is247 && keepConnectionFor247)) {
-      try {
-        serverQueue.connection.destroy();
-      } catch (error) {
-        console.error('[Voice] destroy connection failed:', error.message);
+    if (!(serverQueue.is247 && keepConnectionFor247)) {
+      // Lavalink configuration does not imply the current connection is a shim:
+      // fallback may have installed a real @discordjs/voice connection.
+      const connection = serverQueue.connection;
+      if (isLavalinkEnabled() || connection?.type === 'lavalink') {
+        await destroyLavalinkPlayer(guildId, reason);
       }
-      serverQueue.connection = null;
+      if (connection && connection.type !== 'lavalink') {
+        try {
+          connection.destroy();
+        } catch (error) {
+          console.error('[Voice] destroy connection failed:', error.message);
+        }
+      }
+      if (serverQueue.connection === connection) serverQueue.connection = null;
     }
 
     if (notify && serverQueue.textChannel) {
@@ -3341,7 +3445,7 @@ export class MusicPlayer {
           recovery: true,
         });
         if (wasPaused) {
-          await this.pause(guildId);
+          this.preservePausedPlayback(guildId, serverQueue);
         }
       }
     } catch (error) {
@@ -3504,13 +3608,17 @@ export class MusicPlayer {
     return connection;
   }
 
-  static async skip(guildId) {
+  static async skip(guildId, options = {}) {
+    if (!this.operationIsValid(options)) return { ok: false, reason: 'stale' };
     if (!this.inTransition(guildId)) {
-      this.interruptPlaybackRecovery(guildId);
-      return this.runTransition(guildId, () => this.skip(guildId), { createQueue: false });
+      // Unguarded user controls may interrupt recovery immediately. Guarded
+      // voice work must wait for its in-lock validity check before any mutation.
+      if (!options.signal && !options.validateOperation) this.interruptPlaybackRecovery(guildId);
+      return this.runTransition(guildId, () => this.skip(guildId, options), { createQueue: false });
     }
     const serverQueue = musicQueue.peek(guildId);
     if (!serverQueue) return { ok: false, reason: 'no-queue' };
+    if (options.signal || options.validateOperation) this.interruptPlaybackRecovery(guildId);
 
     if (serverQueue.skipRequested && serverQueue.currentSong) {
       this.removeQueueItemsById(serverQueue, [serverQueue.currentSong.queueItemId]);
@@ -3518,6 +3626,10 @@ export class MusicPlayer {
     }
 
     const next = await this.resolveNextSongForSkip(guildId, serverQueue);
+    if (!this.operationIsValid(options)) {
+      if (next.song) this.releaseReservedSong(serverQueue, next.song);
+      return { ok: false, reason: 'stale' };
+    }
     if (!next.ok) {
       if (serverQueue.skipRequested && !serverQueue.playing) {
         await this.stopCurrentTrackOnly(guildId, serverQueue);
@@ -3536,7 +3648,7 @@ export class MusicPlayer {
     if (backend === 'lavalink') {
       serverQueue.skipRequested = true;
       try {
-        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source);
+        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source, options);
         if (result?.reason === 'backend-unavailable') return result;
         this.commitReservedSong(serverQueue, next.song);
       } catch (error) {
@@ -3564,7 +3676,7 @@ export class MusicPlayer {
       serverQueue.skipRequested = true;
       serverQueue.player.stop(true);
       try {
-        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source);
+        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source, options);
         if (result?.reason === 'backend-unavailable') return result;
         this.commitReservedSong(serverQueue, next.song);
       } catch (error) {
@@ -3579,7 +3691,7 @@ export class MusicPlayer {
     // player 不存在但有进程被杀掉了，手动触发 advance
     if (serverQueue.skipRequested) {
       try {
-        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source);
+        const result = await this.playSong(guildId, serverQueue.textChannel, next.song, next.source, options);
         if (result?.reason === 'backend-unavailable') return result;
         this.commitReservedSong(serverQueue, next.song);
       } catch (error) {
@@ -3594,9 +3706,10 @@ export class MusicPlayer {
     return { ok: false, reason: 'no-player' };
   }
 
-  static async previous(guildId) {
+  static async previous(guildId, options = {}) {
+    if (!this.operationIsValid(options)) return { ok: false, reason: 'stale' };
     if (!this.inTransition(guildId)) {
-      return this.runTransition(guildId, () => this.previous(guildId), { createQueue: false });
+      return this.runTransition(guildId, () => this.previous(guildId, options), { createQueue: false });
     }
     const serverQueue = musicQueue.peek(guildId);
     if (!serverQueue?.currentSong) return { ok: false, reason: 'no-current-song' };
@@ -3626,7 +3739,8 @@ export class MusicPlayer {
     }
 
     try {
-      await this.playSong(guildId, serverQueue.textChannel, previousSong, previousSong.source || 'manual');
+      if (!this.operationIsValid(options)) return { ok: false, reason: 'stale' };
+      await this.playSong(guildId, serverQueue.textChannel, previousSong, previousSong.source || 'manual', options);
     } catch (error) {
       console.error('[Previous] playSong failed after suppress, forcing advance:', error.message);
       this.advance(guildId, serverQueue);
@@ -3635,11 +3749,12 @@ export class MusicPlayer {
     return { ok: true, song: previousSong };
   }
 
-  static async pause(guildId) {
+  static async pause(guildId, options = {}) {
+    if (!this.operationIsValid(options)) return false;
     const serverQueue = musicQueue.peek(guildId);
     if (!serverQueue) return false;
     if (!this.inTransition(guildId)) {
-      return this.runTransition(guildId, () => this.pause(guildId), { createQueue: false });
+      return this.runTransition(guildId, () => this.pause(guildId, options), { createQueue: false });
     }
     const backend = this.activeBackend(serverQueue);
     const playbackId = serverQueue.playbackId;
@@ -3691,11 +3806,12 @@ export class MusicPlayer {
     return false;
   }
 
-  static async resume(guildId) {
+  static async resume(guildId, options = {}) {
+    if (!this.operationIsValid(options)) return false;
     const serverQueue = musicQueue.peek(guildId);
     if (!serverQueue) return false;
     if (!this.inTransition(guildId)) {
-      return this.runTransition(guildId, () => this.resume(guildId), { createQueue: false });
+      return this.runTransition(guildId, () => this.resume(guildId, options), { createQueue: false });
     }
     const backend = this.activeBackend(serverQueue);
     const playbackId = serverQueue.playbackId;
@@ -3828,7 +3944,7 @@ export class MusicPlayer {
       });
        const recoveredPlaybackId = serverQueue.playbackId;
        if (recoveredPlaybackId <= previousPlaybackId || !this.isCurrentPlayback(serverQueue, recoveredPlaybackId)) return false;
-      if (wasPaused) await this.pause(guildId);
+      if (wasPaused) this.preservePausedPlayback(guildId, serverQueue);
       return true;
     }
     savePlaybackState(guildId, serverQueue);
@@ -3856,7 +3972,7 @@ export class MusicPlayer {
         });
         const recoveredPlaybackId = serverQueue.playbackId;
         if (recoveredPlaybackId <= previousPlaybackId || !this.isCurrentPlayback(serverQueue, recoveredPlaybackId)) return false;
-        if (wasPaused) await this.pause(guildId);
+        if (wasPaused) this.preservePausedPlayback(guildId, serverQueue);
         return true;
       }
        await player.seek(Math.floor(requestedSeconds * 1000));
@@ -3877,7 +3993,7 @@ export class MusicPlayer {
     });
      const recoveredPlaybackId = serverQueue.playbackId;
      if (recoveredPlaybackId <= previousPlaybackId || !this.isCurrentPlayback(serverQueue, recoveredPlaybackId)) return false;
-     if (wasPaused) await this.pause(guildId);
+     if (wasPaused) this.preservePausedPlayback(guildId, serverQueue);
     return true;
   }
 

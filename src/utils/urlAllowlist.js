@@ -60,7 +60,8 @@ function canonicalYouTubeVideo(videoId) {
 export function parseYouTubeUrl(value, { allowPlaylist = true, allowBrowse = true } = {}) {
   const parsed = parseHttpsUrl(value, YOUTUBE_HOSTS);
   if (!parsed || !onlyAllowedQueryKeys(parsed, new Set([
-    'v', 'list', 't', 'start', 'end', 'si', 'index', 'feature', 'pp', 'ab_channel',
+    // YouTube Mix adds start_radio; canonicalization discards it and list for videos.
+    'v', 'list', 'start_radio', 't', 'start', 'end', 'si', 'index', 'feature', 'pp', 'ab_channel',
   ]))) return null;
 
   const host = parsed.hostname.toLowerCase();

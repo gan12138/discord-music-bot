@@ -1,6 +1,5 @@
 import { ActionRowBuilder, SlashCommandBuilder, StringSelectMenuBuilder } from 'discord.js';
 import { musicQueue, MusicPlayer } from '../utils/player.js';
-import { isLavalinkEnabled, destroyLavalinkPlayer } from '../utils/lavalink.js';
 import { Bilibili } from '../utils/bilibili.js';
 import { YouTube } from '../utils/youtube.js';
 import { SpotifyHandler } from '../utils/spotify.js';
@@ -49,6 +48,8 @@ export async function execute(interaction) {
 
   let songs = [];
   let queuedItemIds = [];
+  let enqueueQueue = null;
+  let enqueueGeneration = null;
 
   try {
     if (SpotifyHandler.isSpotifyUrl(query)) {
@@ -89,26 +90,9 @@ export async function execute(interaction) {
           songs = playlist;
         }
       } else {
-        // 对单个 YouTube URL，并行获取视频信息和加入语音频道以减少延迟
-        const voiceNeedsJoin = voiceChannel && !musicQueue.peek(interaction.guild.id)?.connection;
-        const infoPromise = YouTube.getVideoInfo(query);
-        let video;
-        if (voiceNeedsJoin) {
-          const [loadedVideo, connection] = await Promise.all([
-            infoPromise,
-            MusicPlayer.joinVoice(
-              voiceChannel,
-              interaction.guild.id,
-              interaction.guild.voiceAdapterCreator
-            ),
-          ]);
-          video = loadedVideo;
-          const sq = musicQueue.get(interaction.guild.id);
-          sq.connection = connection;
-          timingLog(t0, 'early joinVoice completed');
-        } else {
-          video = await infoPromise;
-        }
+        // Join only after metadata succeeds, through the shared enqueue transition.
+        // A failed lookup must not leave an unowned, idle voice connection.
+        const video = await YouTube.getVideoInfo(query);
         timingLog(t0, 'youtube video info loaded');
         if (video) {
           songs.push(video);
@@ -159,7 +143,8 @@ export async function execute(interaction) {
       return interaction.editReply('❌ 未找到任何歌曲！');
     }
 
-    const serverQueue = musicQueue.get(interaction.guild.id);
+    enqueueQueue = musicQueue.get(interaction.guild.id);
+    enqueueGeneration = enqueueQueue.lifecycleGeneration;
     queuedItemIds = songs
       .map(song => MusicPlayer.ensureQueueItemId(song)?.queueItemId)
       .filter(Boolean);
@@ -167,29 +152,24 @@ export async function execute(interaction) {
     timingLog(t0, 'play command completed');
   } catch (error) {
     console.error('Play command error:', error);
-    const serverQueue = musicQueue.peek(interaction.guild.id);
-    if (serverQueue && queuedItemIds.length) {
-      MusicPlayer.removeQueueItemsById(serverQueue, queuedItemIds);
-      savePlaybackState(interaction.guild.id, serverQueue, { immediate: true });
-    }
-    if (serverQueue && !serverQueue.playing && serverQueue.songs.length === 0) {
-      if (serverQueue.is247) {
-        serverQueue.currentSong = null;
-        serverQueue.audioResource = null;
-        serverQueue.seekOffsetSeconds = 0;
-        serverQueue.startedAt = null;
-        serverQueue.pausedAt = null;
+    // Metadata failures have not acquired any playback resources. Only roll back
+    // the queue this command actually used, never a replacement/current session.
+    if (enqueueQueue && queuedItemIds.length) {
+      await MusicPlayer.runTransition(interaction.guild.id, async () => {
+        const serverQueue = musicQueue.peek(interaction.guild.id);
+        if (serverQueue !== enqueueQueue || serverQueue.lifecycleGeneration !== enqueueGeneration
+          || serverQueue.disposed || serverQueue.clearingQueue) return;
+        MusicPlayer.removeQueueItemsById(serverQueue, queuedItemIds);
         savePlaybackState(interaction.guild.id, serverQueue, { immediate: true });
-      } else {
-        if (serverQueue.connection) {
-          if (isLavalinkEnabled()) {
-            await destroyLavalinkPlayer(interaction.guild.id, 'play-command-error');
-          } else {
-            serverQueue.connection.destroy();
-          }
+        if (!serverQueue.playing && !serverQueue.currentSong && serverQueue.songs.length === 0
+          && serverQueue.radioQueue.length === 0 && !serverQueue.radio?.enabled && !serverQueue.is247) {
+          // Shared cleanup also destroys a real local connection when Lavalink
+          // is configured, and cancels delayed state saves/recovery work.
+          await MusicPlayer.clearQueueAndLeave(interaction.guild.id, 'play-command-error', { notify: false });
         }
-        musicQueue.delete(interaction.guild.id);
-      }
+      }, { createQueue: false }).catch(cleanupError => {
+        console.error('Play command cleanup error:', cleanupError);
+      });
     }
 
     const message = error.message?.includes('语音') || error.message?.includes('连接') || error.message?.includes('Bilibili')

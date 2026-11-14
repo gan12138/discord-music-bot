@@ -8,6 +8,9 @@ let nodeRecoveryTimer = null;
 let nodeRecoveryAttempt = 0;
 const nodeReadiness = new WeakMap();
 const nodeInfoEpochs = new WeakMap();
+const nodeReadySessions = new WeakMap();
+const protectedEventNodes = new WeakSet();
+const trackEventTypes = new Set(['TrackStartEvent', 'TrackEndEvent', 'TrackExceptionEvent', 'TrackStuckEvent']);
 
 const DEFAULT_NODE_HEALTH_TIMEOUT_MS = 3_000;
 const DEFAULT_NODE_INFO_REQUEST_TIMEOUT_MS = 1_500;
@@ -234,8 +237,95 @@ function scheduleLavalinkNodeRecovery(delayMs = null) {
 
 function invalidateNodeInfo(node) {
   if (!node) return;
+  nodeReadiness.set(node, false);
+  nodeReadySessions.delete(node);
   nodeInfoEpochs.set(node, (nodeInfoEpochs.get(node) || 0) + 1);
   node.info = null;
+}
+
+function isCurrentReadySession(node, session) {
+  return Boolean(session
+    && nodeReadySessions.get(node) === session
+    && (nodeInfoEpochs.get(node) || 0) === session.epoch
+    && node.connected
+    && node.sessionId === session.sessionId);
+}
+
+function completeNodeReadiness(node) {
+  const session = nodeReadySessions.get(node);
+  if (!isCurrentReadySession(node, session) || !session.infoReady
+    || !session.sessionUpdated || !session.resumeReceived || !isLavalinkNodeHealthy(node)) return;
+
+  nodeReadiness.set(node, true);
+  clearLavalinkNodeRecovery();
+  if (session.notified) return;
+  session.notified = true;
+  Promise.resolve().then(() => {
+    if (!isCurrentReadySession(node, session)) return;
+    return handlers.onNodeReady?.(node, session.payload, session.players);
+  }).catch(error => {
+    console.error('[Lavalink] node ready handler failed:', safeNodeErrorMessage(node, error));
+  });
+}
+
+function trackPlaybackId(track) {
+  const value = track?.userData?.musicBotPlaybackId
+    ?? track?.userData?.playbackId
+    ?? track?.pluginInfo?.userData?.musicBotPlaybackId;
+  const id = Number(value);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function sameEventTrack(current, eventTrack) {
+  if (!current || !eventTrack || typeof eventTrack !== 'object') return false;
+  const currentId = trackPlaybackId(current);
+  const eventId = trackPlaybackId(eventTrack);
+  // A conflicting playback id is decisive when both sides carry one. Lavalink's
+  // event payload carries the server-side track and never our client userData,
+  // so a missing id on the event side is not evidence of a stale event.
+  if (currentId !== null && eventId !== null) return currentId === eventId;
+  const currentEncoded = hasText(current.encoded) ? current.encoded : null;
+  const eventEncoded = hasText(eventTrack.encoded) ? eventTrack.encoded : null;
+  if (currentEncoded && eventEncoded) return currentEncoded === eventEncoded;
+  // Nothing distinguishes the two tracks: fail open so a legitimate event is
+  // never dropped, which would silently stall playback.
+  return true;
+}
+
+function eventTrack(track, payload) {
+  // lavalink-client passes queue.current, which carries our client userData but
+  // may belong to a different song. The payload carries the authoritative event
+  // track, without userData. The event guard has already proven both refer to
+  // the same audio, so keep the payload identity and re-attach the metadata the
+  // playback-id lookups depend on.
+  const payloadTrack = payload && Object.hasOwn(payload, 'track') ? payload.track : null;
+  if (!payloadTrack) return track;
+  if (!track) return payloadTrack;
+  if (payloadTrack.userData || !track.userData) return payloadTrack;
+  return { ...payloadTrack, userData: track.userData };
+}
+
+function protectNodeTrackEvents(node, lavalinkManager) {
+  if (!node || protectedEventNodes.has(node) || typeof node.handleEvent !== 'function') return;
+  protectedEventNodes.add(node);
+  nodeReadiness.set(node, false);
+  const handleEvent = node.handleEvent;
+  const lastEventTracks = new WeakMap();
+  node.handleEvent = function (payload) {
+    if (trackEventTypes.has(payload?.type)) {
+      const player = lavalinkManager.getPlayer(payload.guildId);
+      if (!player || player.node !== this) return Promise.resolve();
+      const current = player.queue?.current;
+      // Terminal events may follow queueEnd (which clears queue.current).
+      // A start without a current track must not resurrect an ended playback.
+      const expected = current || (payload.type !== 'TrackStartEvent' && lastEventTracks.get(player));
+      if (!sameEventTrack(expected, payload.track)) return Promise.resolve();
+      lastEventTracks.set(player, expected);
+    }
+    // Filter before the library mutates playing/queue.current, advances its
+    // queue or sends a stop PATCH in response to TrackStuckEvent.
+    return handleEvent.call(this, payload);
+  };
 }
 
 function withTimeout(operation, timeoutMs) {
@@ -259,6 +349,7 @@ function withTimeout(operation, timeoutMs) {
 async function refreshLavalinkNodeInfo(node, timeoutMs = DEFAULT_NODE_INFO_REQUEST_TIMEOUT_MS) {
   if (!node?.connected) return false;
   const epoch = nodeInfoEpochs.get(node) || 0;
+  const sessionId = node.sessionId;
 
   const requestInfo = typeof node.fetchInfo === 'function'
     ? () => node.fetchInfo()
@@ -269,9 +360,12 @@ async function refreshLavalinkNodeInfo(node, timeoutMs = DEFAULT_NODE_INFO_REQUE
 
   try {
     const info = await withTimeout(requestInfo, timeoutMs);
-    if (!node.connected || (nodeInfoEpochs.get(node) || 0) !== epoch) return false;
+    if (!node.connected || (nodeInfoEpochs.get(node) || 0) !== epoch || node.sessionId !== sessionId) return false;
     if (!isValidLavalinkInfo(info)) return false;
     node.info = info;
+    const session = nodeReadySessions.get(node);
+    if (isCurrentReadySession(node, session)) session.infoReady = true;
+    completeNodeReadiness(node);
     return true;
   } catch {
     return false;
@@ -397,16 +491,29 @@ export function createLavalinkManager(client, eventHandlers = {}) {
     },
   });
 
+  // Include nodes recreated after retry exhaustion, not only constructor nodes.
+  const createNode = manager.nodeManager.createNode;
+  manager.nodeManager.createNode = function (...args) {
+    const node = createNode.apply(this, args);
+    protectNodeTrackEvents(node, this.LavalinkManager);
+    return node;
+  };
+  for (const node of getLavalinkNodes(manager)) protectNodeTrackEvents(node, manager);
+
   manager.nodeManager.on('connect', node => {
     // `/v4/info` and the WebSocket ready event can complete in either order.
     if (nodeReadiness.get(node) !== true) nodeReadiness.set(node, false);
     console.log(`[Lavalink] node connected: ${node.id}`);
     if (!isValidLavalinkInfo(node.info)) {
       queueMicrotask(() => refreshLavalinkNodeInfo(node).catch(() => {}));
+    } else {
+      const session = nodeReadySessions.get(node);
+      if (isCurrentReadySession(node, session)) session.infoReady = true;
+      completeNodeReadiness(node);
     }
   });
   manager.nodeManager.on('destroy', (node, reason) => {
-    nodeReadiness.set(node, false);
+    invalidateNodeInfo(node);
     console.warn(`[Lavalink] node destroyed: ${node.id}`, safeNodeErrorMessage(node, reason || 'unknown'));
     if (/NodeReconnectFail/i.test(String(reason || ''))) scheduleLavalinkNodeRecovery();
   });
@@ -427,61 +534,68 @@ export function createLavalinkManager(client, eventHandlers = {}) {
   manager.nodeManager.on('raw', (node, payload) => {
     if (payload?.op !== 'ready') return;
     nodeReadiness.set(node, false);
+    const previousSession = nodeReadySessions.get(node);
+    const sessionChanged = previousSession
+      ? previousSession.sessionId !== payload.sessionId
+      : hasText(node.sessionId) && node.sessionId !== payload.sessionId;
+    if (sessionChanged) node.info = null;
+    const epoch = (nodeInfoEpochs.get(node) || 0) + 1;
+    nodeInfoEpochs.set(node, epoch);
+    const session = {
+      epoch,
+      sessionId: payload.sessionId,
+      payload,
+      infoReady: isValidLavalinkInfo(node.info),
+      sessionUpdated: false,
+      resumeReceived: payload.resumed !== true,
+      players: undefined,
+      notified: false,
+    };
+    nodeReadySessions.set(node, session);
+    // raw is emitted before lavalink-client assigns node.sessionId.
     queueMicrotask(async () => {
-      node.options.sessionId = node.sessionId || undefined;
-      let infoReady = isValidLavalinkInfo(node.info);
-      if (!infoReady) {
-        const refreshed = await refreshLavalinkNodeInfo(node);
-        infoReady = refreshed;
-        if (!refreshed) console.warn('[Lavalink] node ready but /v4/info is unavailable');
+      if (!isCurrentReadySession(node, session)) return;
+      node.options.sessionId = session.sessionId || undefined;
+      if (!session.infoReady && !await refreshLavalinkNodeInfo(node)) {
+        if (isCurrentReadySession(node, session)) console.warn('[Lavalink] node ready but /v4/info is unavailable');
       }
+      if (!isCurrentReadySession(node, session)) return;
       await node.updateSession(true, 60).catch(error => {
         console.warn('[Lavalink] failed to enable session resuming:', safeNodeErrorMessage(node, error));
       });
-      nodeReadiness.set(node, Boolean(infoReady && isLavalinkNodeHealthy(node)));
-      if (nodeReadiness.get(node)) clearLavalinkNodeRecovery();
-      if (nodeReadiness.get(node) && payload.resumed !== true) {
-        Promise.resolve(handlers.onNodeReady?.(node, payload)).catch(error => {
-          console.error('[Lavalink] node ready handler failed:', safeNodeErrorMessage(node, error));
-        });
-      }
+      if (!isCurrentReadySession(node, session)) return;
+      session.sessionUpdated = true;
+      completeNodeReadiness(node);
     });
   });
   manager.nodeManager.on('resumed', (node, payload, players) => {
-    nodeReadiness.set(node, false);
-    Promise.resolve()
-      .then(async () => {
-        const infoReady = isValidLavalinkInfo(node.info) || await refreshLavalinkNodeInfo(node);
-        nodeReadiness.set(node, Boolean(infoReady && isLavalinkNodeHealthy(node)));
-        if (!nodeReadiness.get(node)) return;
-        clearLavalinkNodeRecovery();
-        return handlers.onNodeReady?.(node, payload, players);
-      })
-      .catch(error => {
-        console.error('[Lavalink] node resumed handler failed:', safeNodeErrorMessage(node, error));
-      });
+    const session = nodeReadySessions.get(node);
+    if (!isCurrentReadySession(node, session) || session.payload !== payload) return;
+    session.resumeReceived = true;
+    session.players = players;
+    completeNodeReadiness(node);
   });
 
   manager.on('trackEnd', (player, track, payload) => {
     console.log(`[Lavalink] track end guild=${player.guildId} reason=${payload?.reason || 'unknown'}`);
-    handlers.onTrackEnd?.(player.guildId, player, track, payload);
+    handlers.onTrackEnd?.(player.guildId, player, eventTrack(track, payload), payload);
   });
   manager.on('trackStart', (player, track, payload) => {
     console.log(`[Lavalink] track start guild=${player.guildId}`);
-    handlers.onTrackStart?.(player.guildId, player, track, payload);
+    handlers.onTrackStart?.(player.guildId, player, eventTrack(track, payload), payload);
   });
   manager.on('playerUpdate', (_oldPlayer, player) => handlers.onPlayerUpdate?.(player.guildId, player));
   manager.on('queueEnd', (player, track, payload) => {
     console.log(`[Lavalink] queue end guild=${player.guildId} reason=${payload?.reason || 'unknown'}`);
-    handlers.onQueueEnd?.(player.guildId, player, track, payload);
+    handlers.onQueueEnd?.(player.guildId, player, eventTrack(track, payload), payload);
   });
   manager.on('trackError', (player, track, payload) => {
     console.warn(`[Lavalink] track error guild=${player.guildId}: ${safeNodeErrorMessage(player?.node, payload?.exception?.message || payload?.error || 'unknown')}`);
-    handlers.onTrackError?.(player.guildId, player, track, payload);
+    handlers.onTrackError?.(player.guildId, player, eventTrack(track, payload), payload);
   });
   manager.on('trackStuck', (player, track, payload) => {
     console.warn(`[Lavalink] track stuck guild=${player.guildId} threshold=${payload?.thresholdMs || 'unknown'}`);
-    handlers.onTrackStuck?.(player.guildId, player, track, payload);
+    handlers.onTrackStuck?.(player.guildId, player, eventTrack(track, payload), payload);
   });
   manager.on('playerSocketClosed', (player, payload) => {
     console.warn(`[Lavalink] voice socket closed guild=${player.guildId} code=${payload.code} reason=${safeNodeErrorMessage(player?.node, payload.reason || 'none')}`);

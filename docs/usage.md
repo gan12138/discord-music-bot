@@ -1,83 +1,85 @@
-# 使用指南
+# Usage Guide
 
-[返回首页](../README.md) · [配置指南](configuration.md) · [语音控制](voice-control.md)
+**English** | [中文](zh-CN/usage.md)
 
-先加入语音频道，再用 `/play` 点歌。Spotify 歌曲、专辑和歌单会解析后转换为 YouTube 搜索结果播放，并非直接播放 Spotify 音频。
+[Back to home](../README.md) · [Configuration guide](configuration.md) · [Voice control](voice-control.md)
 
-## 命令列表
+Join a voice channel first, then request songs with `/play`. Spotify tracks, albums and playlists are resolved and converted into YouTube search results rather than played directly from Spotify audio.
 
-| 命令 | 用途 |
-|------|------|
-| `/play <链接/关键词>` | 播放 YouTube、Bilibili、Spotify 或搜索关键词 |
-| `/search <关键词>` | 搜索 YouTube 视频 |
-| `/queue [页码]` | 查看播放队列 |
-| `/nowplaying` | 查看当前播放 |
-| `/skip` | 跳过当前歌曲 |
-| `/pause`、`/resume` | 暂停、继续 |
-| `/stop` | 停止并清空队列 |
-| `/volume <0-100>` | 调整音量 |
-| `/seek <时间>` | 跳转进度，支持 `90`、`1:30`、`01:02:03` |
-| `/filter <模式>` | 设置音频滤镜 |
-| `/shuffle` | 打乱手动队列 |
-| `/loop <模式>` | 设置循环模式 |
-| `/remove <位置>` | 移除队列歌曲 |
-| `/playlist` | 管理持久化歌单 |
-| `/radio`、`/audio` | 自动续播，`/audio` 是别名 |
-| `/ai-music <需求>` | 用自然语言让 AI 点歌 |
-| `/247` | 24/7 语音频道保持 |
-| `/panel` | 获取播放面板 |
-| `/notify` | 设置播放通知方式 |
-| `/version` | 设置 AI/Radio 现场或普通版本偏好 |
-| `/settings dj-role` | 设置或清除 DJ 角色 |
-| `/voice-control` | 管理监听 Bot、STT 和唤醒词等 |
-| `/voice-consent` | 退出或重新加入云 STT |
-| `/help` | 查看帮助 |
+## Commands
 
-## 权限与播放面板
+| Command | Purpose |
+|----------|---------|
+| `/play <link/keywords>` | Play a YouTube, Bilibili or Spotify link, or search by keywords |
+| `/search <keywords>` | Search YouTube videos |
+| `/queue [page]` | Show the playback queue |
+| `/nowplaying` | Show what is currently playing |
+| `/skip` | Skip the current song |
+| `/pause`, `/resume` | Pause, resume |
+| `/stop` | Stop and clear the queue |
+| `/volume <0-100>` | Adjust the volume |
+| `/seek <time>` | Jump to a position; accepts `90`, `1:30`, `01:02:03` |
+| `/filter <mode>` | Set an audio filter |
+| `/shuffle` | Shuffle the manual queue |
+| `/loop <mode>` | Set the loop mode |
+| `/remove <position>` | Remove a song from the queue |
+| `/playlist` | Manage persistent playlists |
+| `/radio`, `/audio` | Automatic continuation; `/audio` is an alias |
+| `/ai-music <request>` | Ask AI to queue songs from a natural-language request |
+| `/247` | Keep the 24/7 voice channel |
+| `/panel` | Get the playback panel |
+| `/notify` | Set how playback notifications are delivered |
+| `/version` | Set the live or regular version preference for AI/Radio |
+| `/settings dj-role` | Set or clear the DJ role |
+| `/voice-control` | Manage the listener Bot, STT, wake words and more |
+| `/voice-consent` | Opt out of or back into cloud STT |
+| `/help` | Show help |
 
-未设置 DJ 角色时，成员都可使用音乐控制；设置后需 DJ 角色或管理服务器权限。播放控制通常还要求与音乐 Bot 位于同一语音频道。
+## Permissions and the Playback Panel
 
-`/247` 开关、`/notify`、`/version`、`/settings`、`/voice-control` 等服务器设置要求管理服务器权限。语音命令对同频道真人开放，个人 STT 退出记录仍生效。
+When no DJ role is set, any member can use the music controls; once it is set, members need the DJ role or Manage Server. Playback controls usually also require being in the same voice channel as the music Bot.
 
-面板支持暂停/继续、上一首、下一首、停止、循环、Radio、队列及监听 Bot 加入/离开。旧播放面板会失效，请用 `/panel` 获取最新面板。
+Server settings such as the `/247` toggle, `/notify`, `/version`, `/settings` and `/voice-control` require Manage Server. Voice commands are open to humans in the same channel, and per-member STT opt-out records still apply.
 
-`/notify` 可选择私密面板、更新公共面板、逐曲通知或关闭通知。
+The panel supports pause/resume, previous, next, stop, loop, Radio, the queue and joining/leaving with the listener Bot. Old playback panels stop working; use `/panel` to get a fresh one.
 
-## Radio 自动续播
+`/notify` can choose a private panel, update a public panel, notify per track, or disable notifications.
 
-Radio 可按风格、年代、语言和心情推荐，开启 AI 后还可生成推荐搜索词或自动识别风格。
+## Radio Auto-Continuation
 
-| 命令 | 用途 |
-|------|------|
-| `/radio start`、`stop` | 开关续播，关闭不影响手动队列 |
-| `/radio status` | 查看状态 |
-| `/radio style` | 设置风格、年代、语言、心情 |
-| `/radio autodetect <true/false>` | 开关 AI 自动风格识别 |
-| `/radio reset` | 清缓存并重新推荐 |
+Radio can recommend by style, era, language and mood; with AI enabled it can also generate recommendation queries or detect the style automatically.
 
-手动点歌进入优先队列，当前 Radio 歌曲自然结束后先播手动歌曲；手动队列播完后 Radio 继续。开启/重置 Radio 不会抢正在播放的手动歌曲。
+| Command | Purpose |
+|----------|---------|
+| `/radio start`, `stop` | Turn continuation on or off; turning it off does not affect the manual queue |
+| `/radio status` | Show the current state |
+| `/radio style` | Set style, era, language and mood |
+| `/radio autodetect <true/false>` | Turn AI style auto-detection on or off |
+| `/radio reset` | Clear the cache and recommend again |
 
-更换风格、版本偏好、关闭/重置 Radio 或手动点歌会使旧推荐任务失效。推荐失败的视频进入冷却，Radio 可尝试最多两个保守匹配的同曲上传版本；用户手动点的 URL 不会自动替换。
+Manual requests go into a priority queue: when the current Radio song ends naturally the manual songs play first, and Radio continues once the manual queue is done. Starting/resetting Radio never takes over a manual song that is already playing.
 
-## 24/7 模式
+Changing style or version preference, turning Radio off/resetting it, or requesting manually invalidates older recommendation jobs. Videos whose recommendations fail go into cooldown, and Radio may try at most two conservatively matched alternate uploads of the same track; URLs the user requested manually are never replaced automatically.
 
-| 命令 | 用途 |
-|------|------|
-| `/247 on`、`off` | 开关频道保持 |
-| `/247 status` | 查看状态 |
+## 24/7 Mode
 
-24/7 只负责保持连接，不抢占点歌。无人时当前歌曲可以播完，后续队列保留、Radio 暂停推荐；有人返回后继续。Bot 重启后会尝试恢复频道及必要播放状态，节点暂未就绪时保留恢复任务。
+| Command | Purpose |
+|----------|---------|
+| `/247 on`, `off` | Turn channel keeping on or off |
+| `/247 status` | Show the current state |
 
-## 歌单
+24/7 only keeps the connection alive and does not pre-empt requests. With nobody present the current song may finish, the rest of the queue is kept and Radio pauses its recommendations; both resume when someone returns. After a Bot restart it tries to restore the channel and the necessary playback state, and keeps the recovery task queued while the node is not ready yet.
 
-| 命令 | 用途 |
-|------|------|
-| `/playlist create <名称>` | 创建歌单 |
-| `/playlist delete <名称>` | 删除歌单 |
-| `/playlist list` | 列出歌单 |
-| `/playlist add <名称> <链接>` | 加入歌曲 |
-| `/playlist show <名称>` | 查看内容 |
-| `/playlist play <名称>` | 播放歌单 |
-| `/playlist ai` | 用自然语言管理歌单，需要配置 AI |
+## Playlists
 
-歌单存储在私有数据文件中，每服务器最多 25 个歌单、每歌单最多 200 首。AI 的破坏性操作会提供确认预览；若预览后歌单已变化，需要重新生成操作。
+| Command | Purpose |
+|----------|---------|
+| `/playlist create <name>` | Create a playlist |
+| `/playlist delete <name>` | Delete a playlist |
+| `/playlist list` | List playlists |
+| `/playlist add <name> <link>` | Add a song |
+| `/playlist show <name>` | Show the contents |
+| `/playlist play <name>` | Play a playlist |
+| `/playlist ai` | Manage playlists in natural language; requires configured AI |
+
+Playlists are stored in the private data file, up to 25 playlists per server and 200 songs per playlist. Destructive AI operations show a confirmation preview; if the playlist has changed since the preview, the operation has to be generated again.
